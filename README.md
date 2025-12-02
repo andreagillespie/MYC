@@ -1,5 +1,5 @@
 # MYC
-Scripts for analysis conducted in preparation of MYC project/SF3B3 manuscript. Experiments included in this repo are:
+Scripts for analysis conducted in preparation of MYC project/SF3B3 manuscript. Unless otherwise noted conditions are NEG-DMSO, dTAG-DMSO, NEG-P300i, dTAG-P300i Experiments included in this repo are:
 
 220519_CUTandRUN: Myc, PolII, H3K27me3
 
