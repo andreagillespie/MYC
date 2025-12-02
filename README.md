@@ -3,7 +3,7 @@ Scripts for analysis conducted in preparation of MYC project/SF3B3 manuscript. E
 
 220519_CUTandRUN: Myc, PolII, H3K27me3
 
-220902_ATAC: late timepoint ATACseq, n=2
+220902_ATAC: late timepoint ATACseq, n=2, originally processed by DV, then reprocessed, analysed and compared in my scripts.
 
 230420_TTseq: Late timepoint TTseq, n=4, nascent and total fractions
 
