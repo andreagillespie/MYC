@@ -1,0 +1,288 @@
+---
+title: "220902_ATAC"
+author: "Andrea"
+date: '2023-04-23'
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+# Dane began processing on this project using the nf-core ATACseq pipeline, these are directories for existing analysis:
+fastq dir: /pipeline/Archives/NextSeq/220901_NB501056_0857_AH2KMTBGXN/ProjectFolders/Project_Dane-Vassiliadis
+project dir: /dawson_genomics/Projects/MYC/220902_ATAC/
+bam dir: /dawson_genomics/Projects/MYC/220902_ATAC/preprocessed_data/nf-core_ATAC_separate/bwa/mergedLibrary/
+
+# nf-core pipeline used macs2 as peak caller, but samples did not cluster well with more difference between replicates than samples
+# I am going to try using genrich as this is method suggested by Harvard Bioinformatics for ATACseq peak calling and we had better results with genrich than macs2 for Brian's ATACseq data
+# genrich requires name sorted bam files so sort bams first, then run genrich
+```{bash}
+for bam in /dawson_genomics/Projects/MYC/220902_ATAC/preprocessed_data/nf-core_ATAC_separate/bwa/mergedLibrary/*bam
+do
+sbatch scripts/namesort.sbatch $bam
+done
+
+# run for each replicate as I'm not confident of replicate concordance based on nf-core output
+for bam in /scratch/teams/dawson_genomics/Projects/MYC/220902_ATAC/bams/*namesort.bam
+do
+sbatch scripts/peak_calling.sbatch $bam
+done
+```
+
+# merge all peak files into a consensus peakset
+```{bash}
+module load bedtools/2.27.1
+
+cd genrich
+# files need to be combined first, then sorted to bedtools preference and finally merged
+cat 3dD.narrowPeak 3dP.narrowPeak 3ND.narrowPeak 3NP.narrowPeak 4dD.narrowPeak 4dP.narrowPeak 4ND.narrowPeak 4NP.narrowPeak > all_peaks.bed
+sort -k1,1 -k2,2n all_peaks.bed > all_peaks.sorted.bed
+bedtools merge -i all_peaks.sorted.bed > consensus_peaks.bed
+cd ..
+```
+
+
+# set paths and load libraries for R
+```{r}
+library(Rsubread)
+library(data.table)
+library(edgeR)
+library(RColorBrewer)
+
+scratch.dir <- "/scratch/teams/dawson_genomics/Projects/MYC/220902_ATAC"
+gen.dir <- file.path(scratch.dir, "genrich")
+bam.dir <- file.path(scratch.dir, "bams")
+plots.dir <- file.path(scratch.dir, "plots")
+deseq.dir <- file.path(scratch.dir, "deseq")
+```
+
+
+# use consensus peakset with featureCounts to get counts for each peak from each sample
+```{r}
+# make SAF file from consensus peaks bed and save
+cons.bed <- fread(file.path(gen.dir, "consensus_peaks.bed"))
+cons.saf <- cbind(paste0("consensus_peak_", seq(1:nrow(cons.bed))), cons.bed, ".")
+colnames(cons.saf) <- c("GeneID", "Chr", "Start", "End", "Strand")
+write.table(
+  cons.saf,
+  file.path(gen.dir, "consensus_peaks.saf"), 
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+  )
+
+bam.files <- list.files(bam.dir, pattern = "namesort.bam", full.names = TRUE)
+counts <- featureCounts(bam.files, annot.ext = cons.saf, isPairedEnd = TRUE)
+```
+
+# make sample annotation
+```{r}
+snames <- gsub("_R1.mLb.clN.namesort.bam", "", colnames(counts$counts))
+sample.ann <- data.frame(
+  "clone" = paste0("c", c(rep(3, 4), rep(4, 4))),
+  "group" = rep(c("dD", "dP", "ND", "NP"), 2),
+  "treatment" = rep(c("DMSO", "P300i"), 4),
+  "pretreatment" = rep(c(rep("dTAG_V", 2), rep("dTAG_NEG", 2)), 2)
+)
+rownames(sample.ann) <- snames
+```
+
+
+# have a look at MDS plot for QC
+```{r}
+# Setting colours
+col.group <- as.factor(sample.ann$group)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+col.group <- as.character(col.group)
+
+pdf(file.path(plots.dir, "MDS_unnorm_counts.pdf"))
+MDS = plotMDS(
+  counts$counts,
+  main = "Unnormalised counts",
+  labels = sample.ann$group, 
+  col = col.group
+  )
+dev.off()
+```
+
+# read into edger and normalise
+```{r}
+dge.counts = DGEList(
+  counts = counts$counts, 
+  group = sample.ann$group
+  )
+
+# cleanup samples
+colnames(dge.counts$counts) <- snames
+row.names(dge.counts$samples) <- snames
+
+dge.counts <- calcNormFactors(dge.counts, method = "TMM")
+```
+
+# more plots for QCing
+```{r}
+# mds of norm counts
+pdf(file.path(plots.dir, "MDS_TMMnorm_counts.pdf"))
+MDS = plotMDS(
+  dge.counts,
+  labels = rownames(sample.ann), 
+  main = "TMM normalised counts",
+  col = col.group
+  )
+dev.off()
+
+# barplot of unnorm and norm counts
+pdf(file = file.path(plots.dir, "barplot_unnorm_counts.pdf"), width = 6, height = 4)
+barplot(
+  colSums(dge.counts$counts), 
+  las = 2, 
+  main = "total reads", 
+  names.arg = rownames(sample.ann), 
+  col = col.group, 
+  cex.names = 0.65
+  )
+dev.off()
+
+pdf(file = file.path(plots.dir, "barplot_TMMnorm_counts.pdf"), width = 6, height = 4)
+barplot(
+  colSums(dge.counts$counts) %*% diag(dge.counts$samples$norm.factors), 
+  las = 2, 
+  main = "TMM norm reads", 
+  names.arg = rownames(sample.ann), 
+  col = col.group, 
+  cex.names = 0.65
+  )
+dev.off()
+```
+
+### MDS plots from genrich consensus peaks look the same as those from nf-core macs calls, poor replicate concordance, possible sample mixup?, leaving here for now
+
+# want to compare ATAC peaks w/react & non-react genes, first merge reps by getting intersect of peaks called in both reps
+```{bash}
+module load bedtools/2.27.1
+
+dname=preprocessed_data/nf-core_ATAC_separate/bwa/mergedLibrary/macs/broadPeak
+
+bedtools intersect -a ${dname}/3dD_R1.mLb.clN_peaks.broadPeak -b ${dname}/4dD_R1.mLb.clN_peaks.broadPeak > bed_files/dD_R1.mLb.clN_peaks.bed
+bedtools intersect -a ${dname}/3dP_R1.mLb.clN_peaks.broadPeak -b ${dname}/4dP_R1.mLb.clN_peaks.broadPeak > bed_files/dP_R1.mLb.clN_peaks.bed
+bedtools intersect -a ${dname}/3ND_R1.mLb.clN_peaks.broadPeak -b ${dname}/4ND_R1.mLb.clN_peaks.broadPeak > bed_files/ND_R1.mLb.clN_peaks.bed
+bedtools intersect -a ${dname}/3NP_R1.mLb.clN_peaks.broadPeak -b ${dname}/4NP_R1.mLb.clN_peaks.broadPeak > bed_files/NP_R1.mLb.clN_peaks.bed
+```
+
+# make bigwigs for DT heatmaps of superenhancers
+```{bash}
+for bam in preprocessed_data/nf-core_ATAC_separate/bwa/mergedLibrary/*sorted.bam
+do
+sbatch scripts/DeeptoolsBamCov.sbatch $bam
+done
+
+sbatch scripts/DTMatrix_ATAC_superEnhancers.sbatch
+```
+
+# macs output from nf-core pipeline did not include bedgraphs, which are needed for macs cmbreps and bdgdiff that are the preferred methods for merging reps and diff peak calling, so rerunning macs to get this output
+```{bash}
+mkdir macs/broadpeaks
+
+for bam in preprocessed_data/nf-core_ATAC_separate/bwa/mergedLibrary/*bam
+do
+sbatch scripts/macs2.sbatch $bam
+done
+```
+
+# combine reps, then call diff peaks and look for motif enrichment in diff accessible regions
+```{bash}
+module load macs/2.2.7.1
+
+dname=macs/broadpeaks
+mkdir ${dname}/cmbreps
+
+macs2 cmbreps -i ${dname}/3dD_treat_pileup.bdg ${dname}/4dD_treat_pileup.bdg -m mean -o ${dname}/cmbreps/dD_treat_pileup.bdg
+macs2 cmbreps -i ${dname}/3dP_treat_pileup.bdg ${dname}/4dP_treat_pileup.bdg -m mean -o ${dname}/cmbreps/dP_treat_pileup.bdg
+macs2 cmbreps -i ${dname}/3ND_treat_pileup.bdg ${dname}/4ND_treat_pileup.bdg -m mean -o ${dname}/cmbreps/ND_treat_pileup.bdg
+macs2 cmbreps -i ${dname}/3NP_treat_pileup.bdg ${dname}/4NP_treat_pileup.bdg -m mean -o ${dname}/cmbreps/NP_treat_pileup.bdg
+
+macs2 cmbreps -i ${dname}/3dD_control_lambda.bdg ${dname}/4dD_control_lambda.bdg -m mean -o ${dname}/cmbreps/dD_control_lambda.bdg
+macs2 cmbreps -i ${dname}/3dP_control_lambda.bdg ${dname}/4dP_control_lambda.bdg -m mean -o ${dname}/cmbreps/dP_control_lambda.bdg
+macs2 cmbreps -i ${dname}/3ND_control_lambda.bdg ${dname}/4ND_control_lambda.bdg -m mean -o ${dname}/cmbreps/ND_control_lambda.bdg
+macs2 cmbreps -i ${dname}/3NP_control_lambda.bdg ${dname}/4NP_control_lambda.bdg -m mean -o ${dname}/cmbreps/NP_control_lambda.bdg
+```
+
+# diffpeak calling
+```{bash}
+mkdir macs_diff
+dname=macs/broadpeaks/cmbreps
+
+sbatch scripts/bdgdiff.sbatch ${dname}/dD_treat_pileup.bdg ${dname}/dD_control_lambda.bdg ${dname}/ND_treat_pileup.bdg ${dname}/ND_control_lambda.bdg dDvND
+sbatch scripts/bdgdiff.sbatch ${dname}/NP_treat_pileup.bdg ${dname}/NP_control_lambda.bdg ${dname}/ND_treat_pileup.bdg ${dname}/ND_control_lambda.bdg NPvND
+sbatch scripts/bdgdiff.sbatch ${dname}/dP_treat_pileup.bdg ${dname}/dP_control_lambda.bdg ${dname}/NP_treat_pileup.bdg ${dname}/NP_control_lambda.bdg dPvNP
+```
+
+# format diff peaks files as homer input
+```{r}
+diff.files <- list.files("bdgdiff", full.names = TRUE)
+
+for(diff.file in diff.files){
+  df <- fread(diff.file)
+  df$V6 <- "."
+  write.table(
+    df,
+    diff.file,
+    sep = "\t",
+    col.names = FALSE,
+    row.names = FALSE,
+    quote = FALSE
+  )
+}
+```
+
+# run homer for diff acc peaks
+```{bash}
+mkdir homer
+
+# only NPvND had any diff acc regions in cond2
+sbatch scripts/homer.sbatch bdgdiff/NPvND_c3.0_cond2.bed
+
+for bed in bdgdiff/*cond1.bed
+do
+sbatch scripts/homer.sbatch $bed
+done
+```
+
+# get peaks sig up in dTAG occurring in intergenic regions for P300 heatmap
+```{bash}
+module load bedtools/2.27.1
+
+bedtools intersect -wa -a bdgdiff/dDvND_c3.0_cond1.bed -b /dawson_genomics/Projects/DNMTi/RNAseq/210108_NB501056_0582_AHMHNFAFX2/Hyperediting/REDItools/bed_files/intergenic_only.bed > bed_files/dDvND_ATACup_intergenic.bed
+```
+
+# need above output w/no chr for comp w/react genes
+```{r}
+atac.up.bed <- fread("bed_files/dDvND_ATACup_intergenic.bed")
+atac.up.bed$V1 <- gsub("chr", "", atac.up.bed$V1)
+write.table(atac.up.bed, "bed_files/dDvND_ATACup_intergenic_nochr.bed", sep = "\t", col.names = FALSE, row.names = FALSE, quote = FALSE)
+```
+
+# for ATACup intergenic regions, are these close to react genes?
+```{bash}
+module load bedtools/2.27.1
+
+bedtools closest -d -a /dawson_genomics/Projects/MYC/230420_TTseq/bed_files/reactivated_genes.bed -b bed_files/dDvND_ATACup_intergenic_nochr.bed > bed_files/reactivated_closest_dDvND_ATACup_intergenic.bed
+```
+
+# examine distances above
+```{r}
+react.atac.up <- fread("bed_files/reactivated_closest_dDvND_ATACup_intergenic.bed")
+```
+
+
+# save session info
+```{r}
+sesh.info <- capture.output(sessionInfo())
+writeLines(
+  sesh.info,
+  file.path(scratch.dir, "session-info", paste0(Sys.Date(), "_ATACseq_220902.txt"))
+)
+```
