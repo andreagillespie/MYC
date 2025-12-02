@@ -1,0 +1,83 @@
+---
+title: "240228_PROseq"
+author: "Andrea"
+date: '2024-04-1203'
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+fastq dir: /pipeline/Runs/NextSeq/240228_VH01624_77_AAF7YYCM5/ProjectFolders/Project_Dane-Vassiliadis/
+project dir: /dawson_genomics/Projects/MYC/240228_PROseq_EARLY
+
+# run processing as in late timepoint PROseq
+```{bash}
+mkdir fastqc
+mkdir fastp
+mkdir bams
+mkdir tdfs
+mkdir logs
+mkdir counts
+
+for fq in /pipeline/Runs/NextSeq/240228_VH01624_77_AAF7YYCM5/ProjectFolders/Project_Dane-Vassiliadis/*/*_R1_001.fastq.gz
+do
+dname=`dirname $fq`
+bname=`basename $fq _R1_001.fastq.gz`
+sbatch scripts/align_Cornell_method.sbatch $fq ${dname}/${bname}_R2_001.fastq.gz
+done
+
+# when trimming has started, run multiqc on untrimmed fastqc
+module load multiqc/1.8
+cd fastqc
+multiqc .
+cd ..
+
+# after processing is done get multiqc on everything
+multiqc .
+```
+
+# merge bams and make bigwigs and make DT plots from all
+```{bash}
+sbatch scripts/mergeBamCov.sbatch bams/SF3B1-C6-new-NEG-3h_S1.sort.dedup.bam bams/SF3B1-C6-old-NEG-3h_S3.sort.dedup.bam SF3B1-NEG
+sbatch scripts/mergeBamCov.sbatch bams/SF3B1-C6-new-V-3h_S2.sort.dedup.bam bams/SF3B1-C6-old-V-3h_S4.sort.dedup.bam SF3B1-V
+sbatch scripts/mergeBamCov.sbatch bams/SF3B3-C3-NEG-3h_S5.sort.dedup.bam bams/SF3B3-C5-NEG-3h_S7.sort.dedup.bam SF3B3-NEG
+sbatch scripts/mergeBamCov.sbatch bams/SF3B3-C3-V-3h_S6.sort.dedup.bam bams/SF3B3-C5-V-3h_S8.sort.dedup.bam SF3B3-V
+sbatch scripts/mergeBamCov.sbatch bams/SF3B5-B6-NEG-3h_S9.sort.dedup.bam bams/SF3B5-D7-NEG-3h_S11.sort.dedup.bam SF3B5-NEG
+sbatch scripts/mergeBamCov.sbatch bams/SF3B5-B6-V-3h_S10.sort.dedup.bam bams/SF3B5-D7-V-3h_S12.sort.dedup.bam SF3B5-V
+
+sbatch scripts/DTMat_GeneRegion_reactGenes_merged.sbatch
+sbatch scripts/DTMat_GeneRegion_pcGenes_merged.sbatch
+```
+
+# make stranded bigwigs from merged bams and DT plots from these
+```{bash}
+sbatch scripts/mergedBamCovStranded.sbatch bams/SF3B1-NEG.merged.sort.bam
+sbatch scripts/mergedBamCovStranded.sbatch bams/SF3B1-V.merged.sort.bam
+sbatch scripts/mergedBamCovStranded.sbatch bams/SF3B3-NEG.merged.sort.bam
+sbatch scripts/mergedBamCovStranded.sbatch bams/SF3B3-V.merged.sort.bam
+sbatch scripts/mergedBamCovStranded.sbatch bams/SF3B5-NEG.merged.sort.bam
+sbatch scripts/mergedBamCovStranded.sbatch bams/SF3B5-V.merged.sort.bam
+
+sbatch scripts/DTMat_GeneRegion_reactGenes_stranded.sbatch
+sbatch scripts/DTMat_GeneRegion_pcGenes_stranded.sbatch
+```
+
+# run fastq screen on raw & trimmed fastqs
+```{bash}
+mkdir fastq_screen
+mkdir trimmed_fastq_screen
+
+for fq in /pipeline/Runs/NextSeq/240228_VH01624_77_AAF7YYCM5/ProjectFolders/Project_Dane-Vassiliadis/*/*_R1_001.fastq.gz
+do
+sbatch scripts/fastq_screen.sbatch $fq
+done
+
+# get multiqc for tscreens
+module load multiqc/1.8
+multiqc -n fastq_screen_multiqc_report.html ./*_screen
+```
+
+
