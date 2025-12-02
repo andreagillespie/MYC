@@ -1,0 +1,1 @@
+/dawson_genomics/Projects/MYC/230420_TTseq/bams/3ND-1-Nascent_S417.sort.dedup.bam,/dawson_genomics/Projects/MYC/230420_TTseq/bams/5ND-1-Nascent_S400.sort.dedup.bam,/dawson_genomics/Projects/MYC/230420_TTseq/bams/5ND-2-Nascent_S421.sort.dedup.bam,/dawson_genomics/Projects/MYC/230420_TTseq/bams/5ND-3-Nascent_S393.sort.dedup.bam
