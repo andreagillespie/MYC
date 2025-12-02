@@ -1,0 +1,1491 @@
+---
+title: "230427_PROseq"
+author: "Andrea"
+date: '2023-05-12'
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+fastq dir: /pipeline/Runs/NextSeq/230427_NB501056_0953_AHK5GLBGXT/ProjectFolders/Project_Dane-Vassiliadis/
+scratch dir: /scratch/teams/dawson_genomics/Projects/MYC/230427_PROseq
+
+# fastqc first
+# scratch dir is working dir unless otherwise noted
+```{bash}
+mkdir fastqc
+mkdir scripts
+mkdir logs
+mkdir session-info
+
+for fq in /pipeline/Runs/NextSeq/230427_NB501056_0953_AHK5GLBGXT/ProjectFolders/Project_Dane-Vassiliadis/*/*_R1_001.fastq.gz
+do
+sbatch scripts/fastqc.sbatch $fq
+done
+
+# when fastqc is finished run multiqc 
+module load multiqc/1.8
+cd fastqc
+multiqc .
+cd ..
+```
+
+# combine runs together for each sample
+```{bash}
+for fq in /pipeline/Runs/NextSeq/230427_NB501056_0953_AHK5GLBGXT/ProjectFolders/Project_Dane-Vassiliadis/*/*_R1_001.fastq.gz
+do
+bname=`basename $fq`
+sname=`basename $fq _R1_001.fastq.gz`
+cat $fq /pipeline/Runs/NextSeq/230406_NB501056_0943_AHK773BGXT/ProjectFolders/Project_Dane-Vassiliadis/*/${bname} > /scratch/teams/dawson_genomics/Projects/MYC/230427_PROseq/comb_fastq/${sname}_comb.fastq.gz
+done
+
+# fastqc combined reads (run from project scratch dir)
+for fq in comb_fastq/*_comb.fastq.gz
+do
+sbatch scripts/fastqc.sbatch $fq
+done
+
+# when fastqc is finished run multiqc 
+module load multiqc/1.8
+cd comb_fastqc
+multiqc .
+cd ..
+```
+
+
+# run nf-core/nascent pipeline on combined fastqs
+```{bash}
+sbatch scripts/run_nfcore-nascent.sbatch
+```
+### tried running nf-core worflow multiple times, but it consistently errors out in "samtools sort" step. Oddly the first sample works successfully, but the second sample (no matter which is second) errors. I can still get samtools sort to work fine outside of the workflow on all samples. Error message is "fromIndex = -1" which is vague and difficult to find any info on. Not mentioned in github issues for the workflow. Stems from a java error. Tried with different aligners, memory, other parameters, but same result. Will raise an issue on their page.
+
+### nf-core dev thinks perhaps hyphens may be causing issue and should be changed to underscore; make new sample sheet and re-run
+# use combined fastqs (made in analysis below) to test while conserving space
+```{r}
+# rename fastqs in com dir
+fq.files <- list.files("comb_fastq", full.names = TRUE)
+for(file in fq.files){
+  file.rename(file, gsub("-", "_", file))
+}
+
+# make new sample sheet from new files names
+fq.files <- list.files("comb_fastq", full.names = TRUE)
+sample.sheet <- data.frame(
+  sample = substr(basename(fq.files), 1, 11),
+  fastq_1 = fq.files,
+  fastq_2 = ""
+)
+
+write.table(
+  sample.sheet,
+  "scripts/samplesheet.csv",
+  sep = ",",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+##################################
+### nf-core pipeline's hardcoded adapters do not include all that were used in the protocol, trying Cornell method again with updatated and comprehensive adapters.fa (all from nf-core + additional from our protocol and Cornell script)
+```{bash}
+for fq in comb_fastq/*_comb.fastq.gz
+do
+sbatch scripts/align_Cornell_method.sbatch $fq
+done
+
+module load multiqc/1.8
+multiqc .
+```
+
+# FOR NEW BAMS FROM MOST RECENT PROCESSING JUST ABOVE: make bams and bigwigs of merged rep 1&2 bwa bams (excluding all rep 3s to not skew merge), then LFC bigwigs and plots from all
+```{bash}
+sbatch scripts/mergeBamCov.sbatch bams/3dD_LATE_R1_S7.sort.dedup.bam bams/5dD_LATE_R1_S3.sort.dedup.bam dD_LATE
+sbatch scripts/mergeBamCov.sbatch bams/3dP_LATE_R1_S8.sort.dedup.bam bams/5dP_LATE_R1_S4.sort.dedup.bam dP_LATE
+sbatch scripts/mergeBamCov.sbatch bams/3ND_LATE_R1_S5.sort.dedup.bam bams/5ND_LATE_R1_S1.sort.dedup.bam ND_LATE
+sbatch scripts/mergeBamCov.sbatch bams/3NP_LATE_R1_S6.sort.dedup.bam bams/5NP_LATE_R1_S2.sort.dedup.bam NP_LATE
+
+sbatch scripts/DeeptoolsBamComp.sbatch bams/dP_LATE.merged.sort.bam bams/NP_LATE.merged.sort.bam dPvNP
+sbatch scripts/DeeptoolsBamComp.sbatch bams/dD_LATE.merged.sort.bam bams/ND_LATE.merged.sort.bam dDvND
+sbatch scripts/DeeptoolsBamComp.sbatch bams/NP_LATE.merged.sort.bam bams/ND_LATE.merged.sort.bam NPvND
+
+sbatch scripts/DTMat_GeneRegion_reactGenes_merged.sbatch
+sbatch scripts/DTMat_GeneRegion_reactGenes_LFC_merged.sbatch
+
+sbatch scripts/DTMat_GeneRegion_allGenes_merged.sbatch
+sbatch scripts/DTMat_GeneRegion_allGenes_LFC_merged.sbatch
+```
+
+# make stranded bigwigs from merged bams and DT plots from these
+```{bash}
+sbatch scripts/mergedBamCovStranded.sbatch bams/dD_LATE.merged.sort.bam
+sbatch scripts/mergedBamCovStranded.sbatch bams/dP_LATE.merged.sort.bam
+sbatch scripts/mergedBamCovStranded.sbatch bams/ND_LATE.merged.sort.bam
+sbatch scripts/mergedBamCovStranded.sbatch bams/NP_LATE.merged.sort.bam
+
+sbatch scripts/DTMat_GeneRegion_reactGenes_stranded.sbatch
+sbatch scripts/DTMat_GeneRegion_allGenes_stranded.sbatch
+```
+
+```{r}
+library(data.table)
+library(edgeR)
+library(ggplot2)
+library(qvalue)
+library(RColorBrewer)
+library(Rsubread)
+library(ComplexHeatmap)
+library(circlize)
+library(annotatr)
+```
+
+
+# re-do edger analysis with new data
+```{r}
+# change counts dir to new counts files
+counts.dir <- file.path(project.dir, "counts")
+
+# get all nascent 
+files <- list.files(counts.dir)
+
+# remake sample annotation with all
+sample.ann <- data.frame(
+  "files" = files, 
+  "samples" = gsub(".count", "", files), 
+  "tag" = c(rep("dTAG-V", 2), rep("dTAG-NEG", 2), rep("dTAG-V", 4), rep("dTAG-NEG", 4)),
+  "treatment" = c(rep(c("DMSO", "P300i"), 2), rep("DMSO", 2), rep("P300i", 2), rep("DMSO", 2), rep("P300i", 2)),
+  "replicate" = c(rep("3_1", 4), rep(c("5_1", "5_2"), 4)),
+  "group" = c("dD", "dP", "ND", "NP", rep("dD", 2), rep("dP", 2), rep("ND", 2), rep("NP", 2))
+  )
+sample.ann
+
+dge.counts = readDGE(
+  file = sample.ann$files, 
+  path = counts.dir,
+  group = sample.ann$group
+  )
+```
+
+# Filtering out genes with low counts & not useful
+```{r}
+noint <- rownames(dge.counts$counts) %in% c("__no_feature", "__ambiguous", "__too_low_aQual","__not_aligned","__alignment_not_unique")
+counts.cpms <- cpm(dge.counts$counts)
+# start with minimal filter
+keep <- rowSums(counts.cpms > 1 ) >= 2 & !noint
+dim(dge.counts$counts)
+dge.counts$counts <- dge.counts$counts[keep,]
+dim(dge.counts$counts)
+```
+
+# calc TMM norm and write out file
+```{r}
+dge.counts <- calcNormFactors(dge.counts, method = "TMM")
+
+# multiply counts by norm factors
+counts.norm <- dge.counts$counts%*%diag(dge.counts$samples$norm.factors)
+colnames(counts.norm) <- colnames(dge.counts$counts)
+```
+
+# batch correct for experimental batch and write out
+```{r}
+# add batch to sample info
+dge.counts$samples$batch <- c(rep("B1", 4), rep(c("B2", "B3"), 4))
+
+# get log cpms for batch correction
+dge.cpm.log <- cpm(dge.counts, normalized.lib.sizes = TRUE, log = TRUE)
+
+batch.cor.counts.norm <- removeBatchEffect(
+	dge.cpm.log, 
+	batch = dge.counts$sample$batch
+	)
+
+# write out batch corrected normalised counts
+write.table(
+  batch.cor.counts.norm,
+  file.path(res.dir, "batchcorrected_TMMnorm_counts.txt"),
+  sep = "\t",
+  col.names = NA,
+  row.names = TRUE,
+  quote = FALSE
+)
+
+# plots MDS of batch cor
+col.group <- as.factor(dge.counts$samples$group)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+col.group <- as.character(col.group)
+
+pdf(file.path(plots.dir, "MDS_TMMnorm_counts_batchCorrected.pdf"))
+MDS = plotMDS(
+  batch.cor.counts.norm,
+  labels = paste0(dge.counts$samples$group, "_", dge.counts$samples$batch), 
+  col = col.group,
+  main = "Batch corrected TMM norm counts"
+  )
+dev.off()
+```
+
+# NP rep3 very poor quality, low reads and high duplication so removing this from analysis
+```{r}
+dge.counts <- dge.counts[, -12]
+batch.cor.counts.norm <- batch.cor.counts.norm[, -12]
+sample.ann <- sample.ann[-12, ]
+
+# make new MDS w/o problem sample
+col.group <- as.factor(dge.counts$samples$group)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+col.group <- as.character(col.group)
+
+pdf(file.path(plots.dir, "MDS_TMMnorm_counts_batchCor_11samples.pdf"))
+MDS = plotMDS(
+  batch.cor.counts.norm,
+  labels = paste0(dge.counts$samples$group, "_", dge.counts$samples$batch), 
+  col = col.group,
+  main = "Batch corrected TMM norm counts, 11 samples"
+  )
+dev.off()
+```
+
+
+# set design and contrasts for DE, include additional comparisons
+```{r}
+# design table
+design = model.matrix(~0+group, data = dge.counts$samples)
+colnames(design) <- gsub("group", "", colnames(design))
+design
+
+# just 1 comparison for now
+contr.matrix <- makeContrasts(
+  dPvNP = dP-NP,
+  dDvND = dD-ND,
+  NPvND = NP-ND,
+  levels = colnames(design)
+  )
+contr.matrix
+```
+
+# DE with batch correction
+```{r}
+# get annotation
+bm.ann <- fread("/data/reference/dawson_labs/biomart_annotations/Hsapiens/ensembl_hgnc_entrez.txt")
+
+# make dge obj from batch corrected counts
+dge.counts <- DGEList(2^(batch.cor.counts.norm), group = sample.ann$group)
+dge.counts = estimateDisp(dge.counts, design)
+gfit <- glmQLFit(dge.counts, design)
+
+ftest.list <- list()
+
+for(contrast.i in 1:length(colnames(contr.matrix))){
+
+  ftest.list[[contrast.i]] <- glmQLFTest(gfit, contrast = contr.matrix[, contrast.i])
+  # add qvalues to table, order by that and write out
+  qv <- qvalue(ftest.list[[contrast.i]]$table$PValue)
+  ftest.list[[contrast.i]]$table$QValue <- qv$qvalues
+  # annotate w/ symbols
+  ftest.list[[contrast.i]]$table$ensg <- rownames(ftest.list[[contrast.i]]$table)
+  ftest.list[[contrast.i]]$table <- merge(ftest.list[[contrast.i]]$table, bm.ann, by.x = "ensg", by.y = "ensembl_gene_id")
+  ftest.list[[contrast.i]]$table <- ftest.list[[contrast.i]]$table[order(ftest.list[[contrast.i]]$table$QValue, decreasing = FALSE),]
+  write.table(
+    ftest.list[[contrast.i]]$table,
+    file.path(res.dir, paste0(colnames(contr.matrix)[contrast.i], "_batchCorrected_ftest_table.txt")),
+    sep = "\t",
+    quote = F,
+    col.names = T,
+    row.names= F
+  )
+}
+names(ftest.list) <- colnames(contr.matrix)
+```
+
+# first calculate elongation across MYC
+```{r}
+# get saf for every 500 bp in myc
+myc.500 <- seq(127735434, 127742951, by = 500)
+myc.saf <- data.frame(
+  "GeneID" = paste0("MYC_", seq(1, length(myc.500), 1)), 
+  "Chr" = 8, 
+  "Start" = myc.500, 
+  "End" = myc.500 + 499, 
+  "Strand" = "+"
+  )
+# remove bin overlapping TES
+myc.saf <- myc.saf[-16, ]
+
+align.dir <- file.path(project.dir, "bams")
+bam.files <- list.files(align.dir, pattern = "sort.dedup.bam$", full.names = TRUE)
+# remove problem sample
+bam.files <- bam.files[-12]
+
+myc.500.counts <- featureCounts(
+  bam.files,
+  annot.ext = myc.saf,
+  allowMultiOverlap = FALSE,
+  largestOverlap = TRUE, 
+  isPairedEnd = FALSE
+)
+colnames(myc.500.counts$counts) <- gsub(".sort.dedup.bam", "", colnames(myc.500.counts$counts))
+
+# normalise with TMM, batch corrected for all reads
+myc.500.norm <- as.matrix(myc.500.counts$counts) %*% diag(dge.counts$samples$lib.size/1000000)
+colnames(myc.500.norm) <- colnames(myc.500.counts$counts)
+
+# get mean across replicates
+myc.500.mean <- data.frame(
+  "dD_LATE" = rowMeans(myc.500.norm[, grepl("dD", colnames(myc.500.norm))]), 
+  "dP_LATE" = rowMeans(myc.500.norm[, grepl("dP", colnames(myc.500.norm))]), 
+  "ND_LATE" = rowMeans(myc.500.norm[, grepl("ND", colnames(myc.500.norm))]),
+  "NP_LATE" = rowMeans(myc.500.norm[, grepl("NP", colnames(myc.500.norm))])
+  )
+
+# get equivalent from TTseq data
+tt.myc.500 <- read.table("/dawson_genomics/Projects/MYC/230420_TTseq/results/MYC_500bins_mean_counts.txt", row.names = 1)
+
+elon.index <- tt.myc.500/myc.500.mean
+
+# make line plot of MYC elongation index
+line.data <- data.frame(
+  group = c(rep("dD", 15), rep("dP", 15), rep("ND", 15), rep("NP", 15)),
+  bins = rep(seq(500, 7500, 500), 4),
+  elongation.index = c(elon.index$dD_LATE, elon.index$dP_LATE, elon.index$ND_LATE, elon.index$NP_LATE)
+)
+
+pdf(file.path(plots.dir, "lineplot_elongation_index_MYC.pdf"))
+ggplot(line.data, aes(x = bins, y = elongation.index, group = group)) +
+  geom_line(aes(color = group)) +
+  geom_point(aes(color = group)) + 
+  scale_color_brewer(palette = "Dark2") + 
+  theme_classic() +
+  labs(title = "MYC elongation index")
+dev.off()
+```
+
+# same for 100bp bins
+```{r}
+# get saf for every 500 bp in myc
+myc.100 <- seq(127735434, 127742951, by = 100)
+myc.saf <- data.frame(
+  "GeneID" = paste0("MYC_", seq(1, length(myc.100), 1)), 
+  "Chr" = 8, 
+  "Start" = myc.100, 
+  "End" = myc.100 + 99, 
+  "Strand" = "+"
+  )
+# remove bin overlapping TES
+myc.saf <- myc.saf[-76, ]
+
+myc.100.counts <- featureCounts(
+  bam.files,
+  annot.ext = myc.saf,
+  allowMultiOverlap = FALSE,
+  largestOverlap = TRUE, 
+  isPairedEnd = FALSE
+)
+colnames(myc.100.counts$counts) <- gsub(".sort.dedup.bam", "", colnames(myc.100.counts$counts))
+
+# normalise with TMM, batch corrected for all reads
+myc.100.norm <- as.matrix(myc.100.counts$counts) %*% diag(dge.counts$samples$lib.size/1000000)
+colnames(myc.100.norm) <- colnames(myc.100.counts$counts)
+
+# get mean across replicates
+myc.100.mean <- data.frame(
+  "dD_LATE" = rowMeans(myc.100.norm[, grepl("dD", colnames(myc.100.norm))]), 
+  "dP_LATE" = rowMeans(myc.100.norm[, grepl("dP", colnames(myc.100.norm))]), 
+  "ND_LATE" = rowMeans(myc.100.norm[, grepl("ND", colnames(myc.100.norm))]),
+  "NP_LATE" = rowMeans(myc.100.norm[, grepl("NP", colnames(myc.100.norm))])
+  )
+
+# get equivalent from TTseq data
+tt.myc.100 <- read.table("/dawson_genomics/Projects/MYC/230420_TTseq/results/MYC_100bins_mean_counts.txt", row.names = 1)
+
+elon.index <- tt.myc.100/myc.100.mean
+
+# make line plot of MYC elongation index
+line.data <- data.frame(
+  group = c(rep("dD", 15), rep("dP", 15), rep("ND", 15), rep("NP", 15)),
+  bins = rep(seq(100, 7500, 100), 4),
+  elongation.index = c(elon.index$dD_LATE, elon.index$dP_LATE, elon.index$ND_LATE, elon.index$NP_LATE)
+)
+
+pdf(file.path(plots.dir, "lineplot_elongation_index_MYC_100bins.pdf"))
+ggplot(line.data, aes(x = bins, y = elongation.index, group = group)) +
+  geom_line(aes(color = group)) +
+  geom_point(aes(color = group)) + 
+  scale_color_brewer(palette = "Dark2") + 
+  theme_classic() +
+  labs(title = "MYC elongation index")
+dev.off()
+```
+
+# for elongation index get reads per 500bp bin for each geneset of interest
+```{r}
+# make saf of 500bp bins for each set of genes, then get feature counts over those
+react.bed <- fread("/dawson_genomics/Projects/MYC/230420_TTseq/bed_files/reactivated_genes.bed")
+non.react.bed <- fread("/dawson_genomics/Projects/MYC/230420_TTseq/bed_files/nonreactivated_genes.bed")
+
+react.500.saf <- NULL
+for(gene.i in 1:nrow(react.bed)){
+  seq.500 <- seq(as.numeric(react.bed[gene.i, 2]), as.numeric(react.bed[gene.i, 3]), by = 500)
+  gene.saf <- cbind(paste0(react.bed[gene.i, 4], "_", seq(1, length(seq.500), 1)), react.bed[gene.i, 1], seq.500, seq.500 + 499, react.bed[gene.i, 6])
+  # remove bin overlapping TES
+  gene.saf <- gene.saf[-length(seq.500), ]
+  react.500.saf <- rbind(react.500.saf, gene.saf)
+}
+colnames(react.500.saf) <- c("GeneID", "Chr", "Start", "End", "Strand")
+
+non.react.500.saf <- NULL
+for(gene.i in 1:nrow(non.react.bed)){
+  seq.500 <- seq(as.numeric(non.react.bed[gene.i, 2]), as.numeric(non.react.bed[gene.i, 3]), by = 500)
+  gene.saf <- cbind(paste0(non.react.bed[gene.i, 4], "_", seq(1, length(seq.500), 1)), non.react.bed[gene.i, 1], seq.500, seq.500 + 499, non.react.bed[gene.i, 6])
+  # remove bin overlapping TES
+  gene.saf <- gene.saf[-length(seq.500), ]
+  non.react.500.saf <- rbind(non.react.500.saf, gene.saf)
+}
+colnames(non.react.500.saf) <- c("GeneID", "Chr", "Start", "End", "Strand")
+
+react.500.counts <- featureCounts(
+  bam.files,
+  annot.ext = react.500.saf,
+  allowMultiOverlap = FALSE,
+  largestOverlap = TRUE, 
+  isPairedEnd = FALSE
+)
+colnames(react.500.counts$counts) <- gsub(".sort.dedup.bam", "", colnames(react.500.counts$counts))
+
+non.react.500.counts <- featureCounts(
+  bam.files,
+  annot.ext = non.react.500.saf,
+  allowMultiOverlap = FALSE,
+  largestOverlap = TRUE, 
+  isPairedEnd = FALSE
+)
+colnames(non.react.500.counts$counts) <- gsub(".sort.dedup.bam", "", colnames(non.react.500.counts$counts))
+
+# get mean across replicates
+react.500.mean <- data.frame(
+  "dD_LATE" = rowMeans(react.500.counts$counts[, grepl("dD", colnames(react.500.counts$counts))]), 
+  "dP_LATE" = rowMeans(react.500.counts$counts[, grepl("dP", colnames(react.500.counts$counts))]), 
+  "ND_LATE" = rowMeans(react.500.counts$counts[, grepl("ND", colnames(react.500.counts$counts))]),
+  "NP_LATE" = rowMeans(react.500.counts$counts[, grepl("NP", colnames(react.500.counts$counts))])
+  )
+
+non.react.500.mean <- data.frame(
+  "dD_LATE" = rowMeans(non.react.500.counts$counts[, grepl("dD", colnames(non.react.500.counts$counts))]), 
+  "dP_LATE" = rowMeans(non.react.500.counts$counts[, grepl("dP", colnames(non.react.500.counts$counts))]), 
+  "ND_LATE" = rowMeans(non.react.500.counts$counts[, grepl("ND", colnames(non.react.500.counts$counts))]),
+  "NP_LATE" = rowMeans(non.react.500.counts$counts[, grepl("NP", colnames(non.react.500.counts$counts))])
+  )
+```
+
+# calculate pause index (promoter/early gene body)
+```{r}
+# make a saf and get counts over each region
+# start with MYC
+myc.pause.saf <- data.frame(
+  "GeneID" = c("MYC_prom", "MYC_earlyBody"), 
+  "Chr" = 8, 
+  "Start" = c(127735434, 127735434+250), 
+  "End" = c(127735434+100, 127735434+2250), 
+  "Strand" = "+"
+  )
+
+myc.pause.counts <- featureCounts(
+  bam.files,
+  annot.ext = myc.pause.saf,
+  allowMultiOverlap = FALSE,
+  largestOverlap = TRUE, 
+  isPairedEnd = FALSE
+)
+colnames(myc.pause.counts$counts) <- gsub(".sort.dedup.bam", "", colnames(myc.pause.counts$counts))
+
+# normalise with TMM, batch corrected for all reads
+myc.pause.norm <- as.matrix(myc.pause.counts$counts) %*% diag(dge.counts$samples$lib.size/1000000)
+colnames(myc.pause.norm) <- colnames(myc.pause.counts$counts)
+
+# get mean across replicates
+myc.pause.mean <- data.frame(
+  "dD_LATE" = rowMeans(myc.pause.norm[, grepl("dD", colnames(myc.pause.norm))]), 
+  "dP_LATE" = rowMeans(myc.pause.norm[, grepl("dP", colnames(myc.pause.norm))]), 
+  "ND_LATE" = rowMeans(myc.pause.norm[, grepl("ND", colnames(myc.pause.norm))]),
+  "NP_LATE" = rowMeans(myc.pause.norm[, grepl("NP", colnames(myc.pause.norm))])
+  )
+
+# get pause index for each condition, multiply by 20 to account for 20 fold difference in bin size
+myc.pause.index <- 20 * myc.pause.mean["MYC_prom", ]/myc.pause.mean["MYC_earlyBody", ]
+```
+
+# calculate pause index for reactivated and non-reactivated sets and make boxplots
+```{r}
+# get counts for promoters 
+react.prom.saf <- data.frame(
+  "GeneID" = paste0(react.bed$V4, "_prom"), 
+  "Chr" = react.bed$V1, 
+  "Start" = react.bed$V2, 
+  "End" = react.bed$V2+100, 
+  "Strand" = react.bed$V6
+  )
+
+react.prom.counts <- featureCounts(
+  bam.files,
+  annot.ext = react.prom.saf,
+  allowMultiOverlap = FALSE,
+  largestOverlap = TRUE, 
+  isPairedEnd = FALSE
+)
+colnames(react.prom.counts$counts) <- gsub(".sort.dedup.bam", "", colnames(react.prom.counts$counts))
+
+# normalise with TMM, batch corrected for all reads
+react.prom.norm <- as.matrix(react.prom.counts$counts) %*% diag(dge.counts$samples$lib.size/1000000)
+colnames(react.prom.norm) <- colnames(react.prom.counts$counts)
+
+# get mean across replicates
+react.prom.mean <- data.frame(
+  "dD_LATE" = rowMeans(react.prom.norm[, grepl("dD", colnames(react.prom.norm))]), 
+  "dP_LATE" = rowMeans(react.prom.norm[, grepl("dP", colnames(react.prom.norm))]), 
+  "ND_LATE" = rowMeans(react.prom.norm[, grepl("ND", colnames(react.prom.norm))]),
+  "NP_LATE" = rowMeans(react.prom.norm[, grepl("NP", colnames(react.prom.norm))])
+  )
+
+# now counts for early gene body
+react.body.saf <- data.frame(
+  "GeneID" = paste0(react.bed$V4, "_earlyBody"), 
+  "Chr" = react.bed$V1, 
+  "Start" = react.bed$V2+250, 
+  "End" = react.bed$V2+2250, 
+  "Strand" = react.bed$V6
+  )
+
+react.body.counts <- featureCounts(
+  bam.files,
+  annot.ext = react.body.saf,
+  allowMultiOverlap = FALSE,
+  largestOverlap = TRUE, 
+  isPairedEnd = FALSE
+)
+colnames(react.body.counts$counts) <- gsub(".sort.dedup.bam", "", colnames(react.body.counts$counts))
+
+# normalise with TMM, batch corrected for all reads
+react.body.norm <- as.matrix(react.body.counts$counts) %*% diag(dge.counts$samples$lib.size/1000000)
+colnames(react.body.norm) <- colnames(react.body.counts$counts)
+
+# get mean across replicates
+react.body.mean <- data.frame(
+  "dD_LATE" = rowMeans(react.body.norm[, grepl("dD", colnames(react.body.norm))]), 
+  "dP_LATE" = rowMeans(react.body.norm[, grepl("dP", colnames(react.body.norm))]), 
+  "ND_LATE" = rowMeans(react.body.norm[, grepl("ND", colnames(react.body.norm))]),
+  "NP_LATE" = rowMeans(react.body.norm[, grepl("NP", colnames(react.body.norm))])
+  )
+
+# get pause index for each condition
+react.pause.index <- log2(20 * (react.prom.mean/react.body.mean))
+
+# make boxplot of each condition
+box.data <- data.frame(
+  group = c(rep("dD", nrow(react.pause.index)), rep("dP", nrow(react.pause.index)), rep("ND", nrow(react.pause.index)), rep("NP", nrow(react.pause.index))),
+  pause.index = c(react.pause.index$dD_LATE, react.pause.index$dP_LATE, react.pause.index$ND_LATE, react.pause.index$NP_LATE)
+)
+
+pdf(file.path(plots.dir, "violin_pause_index_reactGenes.pdf"))
+ggplot(box.data, aes(x = group, y = pause.index, fill = group)) +
+  geom_violin() +
+  scale_color_brewer(palette = "Dark2") + 
+  theme_classic() +
+  labs(title = "Reactivated genes pause index") +
+  ylim(-5, 10)
+dev.off()
+```
+
+# now non-reactivated 
+```{r}
+# get counts for promoters 
+non.react.prom.saf <- data.frame(
+  "GeneID" = paste0(non.react.bed$V4, "_prom"), 
+  "Chr" = non.react.bed$V1, 
+  "Start" = non.react.bed$V2, 
+  "End" = non.react.bed$V2+100, 
+  "Strand" = non.react.bed$V6
+  )
+
+non.react.prom.counts <- featureCounts(
+  bam.files,
+  annot.ext = non.react.prom.saf,
+  allowMultiOverlap = FALSE,
+  largestOverlap = TRUE, 
+  isPairedEnd = FALSE
+)
+colnames(non.react.prom.counts$counts) <- gsub(".sort.dedup.bam", "", colnames(non.react.prom.counts$counts))
+
+# normalise with TMM, batch corrected for all reads
+non.react.prom.norm <- as.matrix(non.react.prom.counts$counts) %*% diag(dge.counts$samples$lib.size/1000000)
+colnames(non.react.prom.norm) <- colnames(non.react.prom.counts$counts)
+
+# get mean across replicates
+non.react.prom.mean <- data.frame(
+  "dD_LATE" = rowMeans(non.react.prom.norm[, grepl("dD", colnames(non.react.prom.norm))]), 
+  "dP_LATE" = rowMeans(non.react.prom.norm[, grepl("dP", colnames(non.react.prom.norm))]), 
+  "ND_LATE" = rowMeans(non.react.prom.norm[, grepl("ND", colnames(non.react.prom.norm))]),
+  "NP_LATE" = rowMeans(non.react.prom.norm[, grepl("NP", colnames(non.react.prom.norm))])
+  )
+
+# now counts for early gene body
+non.react.body.saf <- data.frame(
+  "GeneID" = paste0(non.react.bed$V4, "_earlyBody"), 
+  "Chr" = non.react.bed$V1, 
+  "Start" = non.react.bed$V2+250, 
+  "End" = non.react.bed$V2+2250, 
+  "Strand" = non.react.bed$V6
+  )
+
+non.react.body.counts <- featureCounts(
+  bam.files,
+  annot.ext = non.react.body.saf,
+  allowMultiOverlap = FALSE,
+  largestOverlap = TRUE, 
+  isPairedEnd = FALSE
+)
+colnames(non.react.body.counts$counts) <- gsub(".sort.dedup.bam", "", colnames(non.react.body.counts$counts))
+
+# normalise with TMM, batch corrected for all reads
+non.react.body.norm <- as.matrix(non.react.body.counts$counts) %*% diag(dge.counts$samples$lib.size/1000000)
+colnames(non.react.body.norm) <- colnames(non.react.body.counts$counts)
+
+# get mean across replicates
+non.react.body.mean <- data.frame(
+  "dD_LATE" = rowMeans(non.react.body.norm[, grepl("dD", colnames(non.react.body.norm))]), 
+  "dP_LATE" = rowMeans(non.react.body.norm[, grepl("dP", colnames(non.react.body.norm))]), 
+  "ND_LATE" = rowMeans(non.react.body.norm[, grepl("ND", colnames(non.react.body.norm))]),
+  "NP_LATE" = rowMeans(non.react.body.norm[, grepl("NP", colnames(non.react.body.norm))])
+  )
+
+# get pause index for each condition
+non.react.pause.index <- log2(20 * non.react.prom.mean/non.react.body.mean)
+
+# make boxplot of each condition
+box.data <- data.frame(
+  group = c(rep("dD", nrow(non.react.pause.index)), rep("dP", nrow(non.react.pause.index)), rep("ND", nrow(non.react.pause.index)), rep("NP", nrow(non.react.pause.index))),
+  pause.index = c(non.react.pause.index$dD_LATE, non.react.pause.index$dP_LATE, non.react.pause.index$ND_LATE, non.react.pause.index$NP_LATE)
+)
+
+pdf(file.path(plots.dir, "violin_pause_index_nonreactGenes.pdf"))
+ggplot(box.data, aes(x = group, y = pause.index, fill = group)) +
+  geom_violin() +
+  scale_color_brewer(palette = "Dark2") + 
+  theme_classic() +
+  labs(title = "Non-reactivated genes pause index") +
+  ylim(-5, 10)
+dev.off()
+```
+
+# infer experiment strandedness
+```{bash}
+infer_experiment.py -i Desktop/Projects/MYC/5NP_LATE_R1_S2.sort.dedup.bam -r Desktop/Projects/MYC/Hg38EnsGeneDT.bed 
+[E::idx_find_and_load] Could not retrieve index file for 'Desktop/Projects/MYC/5NP_LATE_R1_S2.sort.dedup.bam'
+Reading reference gene model Desktop/Projects/MYC/Hg38EnsGeneDT.bed ... Done
+Loading SAM/BAM file ...  Total 200000 usable reads were sampled
+
+
+This is SingleEnd Data
+Fraction of reads failed to determine: 0.0813
+Fraction of reads explained by "++,--": 0.1136
+Fraction of reads explained by "+-,-+": 0.8050
+```
+
+
+# examine termination defect by calculating post TES + 5k reads over last exon reads normalised by exon length: TES->+5000/((last.exon/exon.length)*5000)
+```{r}
+exon.ann <- fread("/dawson_genomics/Projects/MYC/230420_TTseq/bed_files/exon_ann.txt")
+
+# first make safs for downstream region and last exon to count reads over
+downstream.saf <- data.frame(
+  "GeneID" = react.bed$V4,
+  "Chr" = react.bed$V1,
+  "Start" = react.bed$V3,
+  "End" = react.bed$V3 + 5000,
+  "Strand" = react.bed$V6
+)
+
+last.exon.saf <- NULL
+for(r.gene in 1:nrow(react.bed)){
+  gene.sub <- subset(exon.ann, GeneName == react.bed$V4[r.gene])
+  if(nrow(gene.sub) == 0){next}
+  gene.le.saf <- cbind(
+    react.bed$V4[r.gene],
+    react.bed$V1[r.gene], 
+    gene.sub$Start[which(gene.sub$ExonNumber == max(gene.sub$ExonNumber))], 
+    gene.sub$End[which(gene.sub$ExonNumber == max(gene.sub$ExonNumber))],
+    react.bed$V6[r.gene]
+    )
+  last.exon.saf <- rbind(last.exon.saf, gene.le.saf)
+}
+last.exon.saf <- as.data.frame(last.exon.saf)
+colnames(last.exon.saf) <- c("GeneID","Chr", "Start", "End", "Strand")
+
+# make sure safs have identical genes/rows
+downstream.saf <- downstream.saf[-which(duplicated(downstream.saf)), ]
+last.exon.saf <- last.exon.saf[-which(duplicated(last.exon.saf)), ]
+downstream.saf <- downstream.saf[which(downstream.saf$GeneID %in% last.exon.saf$GeneID), ]
+last.exon.saf <- last.exon.saf[which(last.exon.saf$GeneID %in% downstream.saf$GeneID), ]
+identical(downstream.saf$GeneID, last.exon.saf$GeneID)
+
+downstream.counts <- featureCounts(
+  bam.files,
+  annot.ext = downstream.saf,
+  allowMultiOverlap = FALSE,
+  largestOverlap = TRUE, 
+  isPairedEnd = FALSE,
+  strandSpecific = 2
+)
+colnames(downstream.counts$counts) <- gsub(".sort.dedup.bam", "", colnames(downstream.counts$counts))
+
+last.exon.counts <- featureCounts(
+  bam.files,
+  annot.ext = last.exon.saf,
+  allowMultiOverlap = FALSE,
+  largestOverlap = TRUE, 
+  isPairedEnd = FALSE,
+  strandSpecific = 2
+)
+colnames(last.exon.counts$counts) <- gsub(".sort.dedup.bam", "", colnames(last.exon.counts$counts))
+
+# normalise with TMM, batch corrected for all reads
+downstream.norm <- as.matrix(downstream.counts$counts) %*% diag(dge.counts$samples$lib.size/1000000)
+colnames(downstream.norm) <- colnames(downstream.counts$counts)
+
+last.exon.norm <- as.matrix(last.exon.counts$counts) %*% diag(dge.counts$samples$lib.size/1000000)
+colnames(last.exon.norm) <- colnames(last.exon.counts$counts)
+
+# get mean across replicates
+downstream.mean <- data.frame(
+  "dD_LATE" = rowMeans(downstream.norm[, grepl("dD", colnames(downstream.norm))]), 
+  "dP_LATE" = rowMeans(downstream.norm[, grepl("dP", colnames(downstream.norm))]), 
+  "ND_LATE" = rowMeans(downstream.norm[, grepl("ND", colnames(downstream.norm))]),
+  "NP_LATE" = rowMeans(downstream.norm[, grepl("NP", colnames(downstream.norm))])
+  )
+
+last.exon.mean <- data.frame(
+  "dD_LATE" = rowMeans(last.exon.norm[, grepl("dD", colnames(last.exon.norm))]), 
+  "dP_LATE" = rowMeans(last.exon.norm[, grepl("dP", colnames(last.exon.norm))]), 
+  "ND_LATE" = rowMeans(last.exon.norm[, grepl("ND", colnames(last.exon.norm))]),
+  "NP_LATE" = rowMeans(last.exon.norm[, grepl("NP", colnames(last.exon.norm))])
+  )
+
+last.exon.length <- as.numeric(last.exon.saf$End) - as.numeric(last.exon.saf$Start)
+# first get last exon reads per base to make calculations clearer
+last.exon.rpb <- t(t(last.exon.mean) / last.exon.length)
+rt.score <- downstream.mean / ((last.exon.rpb) * 5000)
+```
+
+# same over non.react genes
+```{r}
+# first make safs for downstream region and last exon to count reads over
+nr.downstream.saf <- data.frame(
+  "GeneID" = non.react.bed$V4,
+  "Chr" = non.react.bed$V1,
+  "Start" = non.react.bed$V3,
+  "End" = non.react.bed$V3 + 5000,
+  "Strand" = non.react.bed$V6
+)
+
+nr.last.exon.saf <- NULL
+for(nr.gene in 1:nrow(non.react.bed)){
+  gene.sub <- subset(exon.ann, GeneName == non.react.bed$V4[nr.gene])
+  if(nrow(gene.sub) == 0){next}
+  gene.le.saf <- cbind(
+    non.react.bed$V4[nr.gene],
+    non.react.bed$V1[nr.gene], 
+    gene.sub$Start[which(gene.sub$ExonNumber == max(gene.sub$ExonNumber))], 
+    gene.sub$End[which(gene.sub$ExonNumber == max(gene.sub$ExonNumber))],
+    non.react.bed$V6[nr.gene]
+    )
+  nr.last.exon.saf <- rbind(nr.last.exon.saf, gene.le.saf)
+}
+nr.last.exon.saf <- as.data.frame(nr.last.exon.saf)
+colnames(nr.last.exon.saf) <- c("GeneID","Chr", "Start", "End", "Strand")
+
+# make sure safs have identical genes/rows
+nr.downstream.saf <- nr.downstream.saf[-which(duplicated(nr.downstream.saf)), ]
+nr.last.exon.saf <- nr.last.exon.saf[-which(duplicated(nr.last.exon.saf)), ]
+nr.downstream.saf <- nr.downstream.saf[which(nr.downstream.saf$GeneID %in% nr.last.exon.saf$GeneID), ]
+nr.last.exon.saf <- nr.last.exon.saf[which(nr.last.exon.saf$GeneID %in% nr.downstream.saf$GeneID), ]
+identical(nr.downstream.saf$GeneID, nr.last.exon.saf$GeneID)
+
+nr.downstream.counts <- featureCounts(
+  bam.files,
+  annot.ext = nr.downstream.saf,
+  allowMultiOverlap = FALSE,
+  largestOverlap = TRUE, 
+  isPairedEnd = FALSE,
+  strandSpecific = 2
+)
+colnames(nr.downstream.counts$counts) <- gsub(".sort.dedup.bam", "", colnames(nr.downstream.counts$counts))
+
+nr.last.exon.counts <- featureCounts(
+  bam.files,
+  annot.ext = nr.last.exon.saf,
+  allowMultiOverlap = FALSE,
+  largestOverlap = TRUE, 
+  isPairedEnd = FALSE,
+  strandSpecific = 2
+)
+colnames(nr.last.exon.counts$counts) <- gsub(".sort.dedup.bam", "", colnames(nr.last.exon.counts$counts))
+
+# normalise with TMM, batch corrected for all reads
+nr.downstream.norm <- as.matrix(nr.downstream.counts$counts) %*% diag(dge.counts$samples$lib.size/1000000)
+colnames(nr.downstream.norm) <- colnames(nr.downstream.counts$counts)
+
+nr.last.exon.norm <- as.matrix(nr.last.exon.counts$counts) %*% diag(dge.counts$samples$lib.size/1000000)
+colnames(nr.last.exon.norm) <- colnames(nr.last.exon.counts$counts)
+
+# get mean across replicates
+nr.downstream.mean <- data.frame(
+  "dD_LATE" = rowMeans(nr.downstream.norm[, grepl("dD", colnames(nr.downstream.norm))]), 
+  "dP_LATE" = rowMeans(nr.downstream.norm[, grepl("dP", colnames(nr.downstream.norm))]), 
+  "ND_LATE" = rowMeans(nr.downstream.norm[, grepl("ND", colnames(nr.downstream.norm))]),
+  "NP_LATE" = rowMeans(nr.downstream.norm[, grepl("NP", colnames(nr.downstream.norm))])
+  )
+
+nr.last.exon.mean <- data.frame(
+  "dD_LATE" = rowMeans(nr.last.exon.norm[, grepl("dD", colnames(nr.last.exon.norm))]), 
+  "dP_LATE" = rowMeans(nr.last.exon.norm[, grepl("dP", colnames(nr.last.exon.norm))]), 
+  "ND_LATE" = rowMeans(nr.last.exon.norm[, grepl("ND", colnames(nr.last.exon.norm))]),
+  "NP_LATE" = rowMeans(nr.last.exon.norm[, grepl("NP", colnames(nr.last.exon.norm))])
+  )
+
+# calculate rt score per condition
+nr.last.exon.length <- as.numeric(nr.last.exon.saf$End) - as.numeric(nr.last.exon.saf$Start)
+# first get last exon reads per base to make calculations clearer
+nr.last.exon.rpb <- t(t(nr.last.exon.mean) / nr.last.exon.length)
+nr.rt.score <- nr.downstream.mean / ((nr.last.exon.rpb) * 5000)
+```
+
+# make heatmaps of rt.scores
+```{r}
+# needs to be a matrix and log transform for readability
+rt.score.mat <- as.matrix(log10(rt.score))
+rt.score.mat[is.infinite(rt.score.mat)] <- 0
+
+col_fun = colorRamp2(seq(-4, 4, length = 16), col = rev(heat.colors(16)))
+
+pdf(file.path(plots.dir, "Heatmap_PROseq_reactGenes_readthroughScore.pdf"))
+Heatmap(rt.score.mat, name = "log10(RT score)", col = col_fun, column_title = "PROseq reactivated genes readthrough", row_names_gp = gpar(fontsize = 2), cluster_columns = FALSE)
+dev.off()
+
+nr.rt.score.mat <- as.matrix(log10(nr.rt.score))
+nr.rt.score.mat[is.infinite(nr.rt.score.mat)] <- 0
+nr.rt.score.mat[is.nan(nr.rt.score.mat)] <- 0
+
+pdf(file.path(plots.dir, "Heatmap_PROseq_nonreactGenes_readthroughScore.pdf"))
+Heatmap(nr.rt.score.mat, name = "log10(RT score)", col = col_fun, column_title = "PROseq non-reactivated genes readthrough", row_names_gp = gpar(fontsize = 2), cluster_columns = FALSE)
+dev.off()
+```
+
+# save raw readthrough scores
+```{r}
+write.table(
+  rt.score,
+  file.path(res.dir, "PROseq_reactGenes_readthroughScores.txt"),
+  sep = "\t",
+  col.names = NA,
+  row.names = TRUE,
+  quote = FALSE
+)
+
+write.table(
+  nr.rt.score,
+  file.path(res.dir, "PROseq_nonreactGenes_readthroughScores.txt"),
+  sep = "\t",
+  col.names = NA,
+  row.names = TRUE,
+  quote = FALSE
+)
+```
+
+# check readthrough upstream of TSS for gene lists to see if readthrough could be bleeding into the gene
+```{r}
+# cheack reads 1k upstream and first 1k of gene body for comparison
+upstream.saf <- data.frame(
+  "GeneID" = react.bed$V4,
+  "Chr" = react.bed$V1,
+  "Start" = react.bed$V2 - 5000,
+  "End" = react.bed$V2,
+  "Strand" = react.bed$V6
+)
+
+first.exon.saf <- NULL
+for(r.gene in 1:nrow(react.bed)){
+  gene.sub <- subset(exon.ann, GeneName == react.bed$V4[r.gene])
+  if(nrow(gene.sub) == 0){next}
+  gene.fe.saf <- cbind(
+    react.bed$V4[r.gene],
+    react.bed$V1[r.gene], 
+    gene.sub$Start[which(gene.sub$ExonNumber == min(gene.sub$ExonNumber))], 
+    gene.sub$End[which(gene.sub$ExonNumber == min(gene.sub$ExonNumber))],
+    react.bed$V6[r.gene]
+    )
+  first.exon.saf <- rbind(first.exon.saf, gene.fe.saf)
+}
+first.exon.saf <- as.data.frame(first.exon.saf)
+colnames(first.exon.saf) <- c("GeneID","Chr", "Start", "End", "Strand")
+
+# make sure safs have identical genes/rows
+upstream.saf <- upstream.saf[-which(duplicated(upstream.saf$GeneID)), ]
+first.exon.saf <- first.exon.saf[-which(duplicated(first.exon.saf$GeneID)), ]
+upstream.saf <- upstream.saf[which(upstream.saf$GeneID %in% first.exon.saf$GeneID), ]
+first.exon.saf <- first.exon.saf[which(first.exon.saf$GeneID %in% upstream.saf$GeneID), ]
+identical(upstream.saf$GeneID, first.exon.saf$GeneID)
+
+upstream.counts <- featureCounts(
+  bam.files,
+  annot.ext = upstream.saf,
+  allowMultiOverlap = FALSE,
+  largestOverlap = TRUE, 
+  isPairedEnd = FALSE,
+  strandSpecific = 2
+)
+colnames(upstream.counts$counts) <- gsub(".sort.dedup.bam", "", colnames(upstream.counts$counts))
+
+first.exon.counts <- featureCounts(
+  bam.files,
+  annot.ext = first.exon.saf,
+  allowMultiOverlap = FALSE,
+  largestOverlap = TRUE, 
+  isPairedEnd = FALSE,
+  strandSpecific = 2
+)
+colnames(first.exon.counts$counts) <- gsub(".sort.dedup.bam", "", colnames(first.exon.counts$counts))
+
+# normalise with TMM, batch corrected for all reads
+upstream.norm <- as.matrix(upstream.counts$counts) %*% diag(dge.counts$samples$lib.size/1000000)
+colnames(upstream.norm) <- colnames(upstream.counts$counts)
+
+first.exon.norm <- as.matrix(first.exon.counts$counts) %*% diag(dge.counts$samples$lib.size/1000000)
+colnames(first.exon.norm) <- colnames(first.exon.counts$counts)
+
+# get mean across replicates
+upstream.mean <- data.frame(
+  "dD_LATE" = rowMeans(upstream.norm[, grepl("dD", colnames(upstream.norm))]), 
+  "dP_LATE" = rowMeans(upstream.norm[, grepl("dP", colnames(upstream.norm))]), 
+  "ND_LATE" = rowMeans(upstream.norm[, grepl("ND", colnames(upstream.norm))]),
+  "NP_LATE" = rowMeans(upstream.norm[, grepl("NP", colnames(upstream.norm))])
+  )
+
+first.exon.mean <- data.frame(
+  "dD_LATE" = rowMeans(first.exon.norm[, grepl("dD", colnames(first.exon.norm))]), 
+  "dP_LATE" = rowMeans(first.exon.norm[, grepl("dP", colnames(first.exon.norm))]), 
+  "ND_LATE" = rowMeans(first.exon.norm[, grepl("ND", colnames(first.exon.norm))]),
+  "NP_LATE" = rowMeans(first.exon.norm[, grepl("NP", colnames(first.exon.norm))])
+  )
+
+# calculate rt score per condition
+first.exon.length <- as.numeric(first.exon.saf$End) - as.numeric(first.exon.saf$Start)
+# first get last exon reads per base to make calculations clearer
+first.exon.rpb <- t(t(first.exon.mean) / first.exon.length)
+up.rt.score <- upstream.mean / ((first.exon.rpb) * 5000)
+```
+
+
+# make CDF travelling ratio plots as in Charlie's paper for each gene group
+```{r}
+react.tss.saf <- data.frame(
+  "GeneID" = react.bed$V4,
+  "Chr" = react.bed$V1,
+  "Start" = react.bed$V2 - 30, 
+  "End" = react.bed$V2 + 300,
+  "Strand" = react.bed$V6
+)
+react.body.saf <- data.frame(
+  "GeneID" = react.bed$V4,
+  "Chr" = react.bed$V1,
+  "Start" = react.bed$V2 + 300, 
+  "End" = react.bed$V3,
+  "Strand" = react.bed$V6
+)
+
+# get counts over regions
+react.tss.counts <- featureCounts(
+  files = bam.files,
+  annot.ext = react.tss.saf,
+  largestOverlap = TRUE
+)
+react.body.counts <- featureCounts(
+  files = bam.files,
+  annot.ext = react.body.saf,
+  largestOverlap = TRUE
+)
+
+# normalise with TMM, batch corrected for all reads
+react.tss.norm <- as.matrix(react.tss.counts$counts) %*% diag(dge.counts$samples$lib.size/1000000)
+colnames(react.tss.norm) <- colnames(react.tss.counts$counts)
+
+react.body.norm <- as.matrix(react.body.counts$counts) %*% diag(dge.counts$samples$lib.size/1000000)
+colnames(react.body.norm) <- colnames(react.body.counts$counts)
+
+# get mean across replicates
+react.tss.mean <- data.frame(
+  "dD_LATE" = rowMeans(react.tss.norm[, grepl("dD", colnames(react.tss.norm))]), 
+  "dP_LATE" = rowMeans(react.tss.norm[, grepl("dP", colnames(react.tss.norm))]), 
+  "ND_LATE" = rowMeans(react.tss.norm[, grepl("ND", colnames(react.tss.norm))]),
+  "NP_LATE" = rowMeans(react.tss.norm[, grepl("NP", colnames(react.tss.norm))])
+  )
+
+react.body.mean <- data.frame(
+  "dD_LATE" = rowMeans(react.body.norm[, grepl("dD", colnames(react.body.norm))]), 
+  "dP_LATE" = rowMeans(react.body.norm[, grepl("dP", colnames(react.body.norm))]), 
+  "ND_LATE" = rowMeans(react.body.norm[, grepl("ND", colnames(react.body.norm))]),
+  "NP_LATE" = rowMeans(react.body.norm[, grepl("NP", colnames(react.body.norm))])
+  )
+
+# get ratio of TSS/body for each sample, use log scale for readability
+react.tr <- log10(react.tss.mean/react.body.mean)
+colnames(react.tr) <- gsub(".sort.dedup.bam", "", colnames(react.tr))
+# remove infinite values
+react.tr <- as.data.frame(react.tr[which(is.finite(react.tr[, 1])),])
+
+# long format for ggplots
+r.cdf.data <- data.frame()
+for(k in 1:4){
+  s.tr <- react.tr[, k]
+  s.cdf <- cbind(rep(gsub("_LATE", "_react", colnames(react.tr)[k]), length(s.tr)), s.tr)
+  r.cdf.data <- rbind(r.cdf.data, s.cdf)
+}
+colnames(r.cdf.data) <- c("sample", "logTR")
+r.cdf.data$logTR <- as.numeric(r.cdf.data$logTR)
+
+# make CDF plots
+pdf("plots/CDF_travelling_ratio_reactGenes.pdf")
+  ggplot(r.cdf.data, aes(logTR, colour = sample)) +
+    stat_ecdf() +
+    theme_bw() +
+    theme(panel.grid = element_blank()) +
+    ggtitle("Cumulative distribution of travelling ratio") +
+    xlab("log(travelling ratio)") +
+    ylab("proportion")
+dev.off()
+```
+
+# now for non-react
+```{r}
+non.react.tss.saf <- data.frame(
+  "GeneID" = non.react.bed$V4,
+  "Chr" = non.react.bed$V1,
+  "Start" = non.react.bed$V2 - 30, 
+  "End" = non.react.bed$V2 + 300,
+  "Strand" = non.react.bed$V6
+)
+non.react.body.saf <- data.frame(
+  "GeneID" = non.react.bed$V4,
+  "Chr" = non.react.bed$V1,
+  "Start" = non.react.bed$V2 + 300, 
+  "End" = non.react.bed$V3,
+  "Strand" = non.react.bed$V6
+)
+
+# get counts over regions
+non.react.tss.counts <- featureCounts(
+  files = bam.files,
+  annot.ext = non.react.tss.saf,
+  largestOverlap = TRUE
+)
+non.react.body.counts <- featureCounts(
+  files = bam.files,
+  annot.ext = non.react.body.saf,
+  largestOverlap = TRUE
+)
+
+# normalise with TMM, batch corrected for all reads
+non.react.tss.norm <- as.matrix(non.react.tss.counts$counts) %*% diag(dge.counts$samples$lib.size/1000000)
+colnames(non.react.tss.norm) <- colnames(non.react.tss.counts$counts)
+
+non.react.body.norm <- as.matrix(non.react.body.counts$counts) %*% diag(dge.counts$samples$lib.size/1000000)
+colnames(non.react.body.norm) <- colnames(non.react.body.counts$counts)
+
+# get mean across replicates
+non.react.tss.mean <- data.frame(
+  "dD_LATE" = rowMeans(non.react.tss.norm[, grepl("dD", colnames(non.react.tss.norm))]), 
+  "dP_LATE" = rowMeans(non.react.tss.norm[, grepl("dP", colnames(non.react.tss.norm))]), 
+  "ND_LATE" = rowMeans(non.react.tss.norm[, grepl("ND", colnames(non.react.tss.norm))]),
+  "NP_LATE" = rowMeans(non.react.tss.norm[, grepl("NP", colnames(non.react.tss.norm))])
+  )
+
+non.react.body.mean <- data.frame(
+  "dD_LATE" = rowMeans(non.react.body.norm[, grepl("dD", colnames(non.react.body.norm))]), 
+  "dP_LATE" = rowMeans(non.react.body.norm[, grepl("dP", colnames(non.react.body.norm))]), 
+  "ND_LATE" = rowMeans(non.react.body.norm[, grepl("ND", colnames(non.react.body.norm))]),
+  "NP_LATE" = rowMeans(non.react.body.norm[, grepl("NP", colnames(non.react.body.norm))])
+  )
+
+# get ratio of TSS/body for each sample, use log scale for readability
+non.react.tr <- log10(non.react.tss.mean/non.react.body.mean)
+colnames(non.react.tr) <- gsub(".sort.dedup.bam", "", colnames(non.react.tr))
+# remove infinite values
+non.react.tr <- as.data.frame(non.react.tr[which(is.finite(non.react.tr[, 1])),])
+
+# log format for ggplots
+nr.cdf.data <- data.frame()
+for(k in 1:4){
+  s.tr <- non.react.tr[, k]
+  s.cdf <- cbind(rep(gsub("_LATE", "_non-react", colnames(non.react.tr)[k]), length(s.tr)), s.tr)
+  nr.cdf.data <- rbind(nr.cdf.data, s.cdf)
+}
+colnames(nr.cdf.data) <- c("sample", "logTR")
+nr.cdf.data$logTR <- as.numeric(nr.cdf.data$logTR)
+
+# make CDF plots
+pdf("plots/CDF_travelling_ratio_nonreactGenes.pdf")
+  ggplot(nr.cdf.data, aes(logTR, colour = sample)) +
+    stat_ecdf() +
+    theme_bw() +
+    theme(panel.grid = element_blank()) +
+    ggtitle("Cumulative distribution of travelling ratio") +
+    xlab("log(travelling ratio)") +
+    ylab("proportion")
+dev.off()
+```
+
+# make combined CDF for both genesets to better show difference
+```{r}
+cdf.data <- rbind(r.cdf.data, nr.cdf.data)
+
+pdf("plots/CDF_travelling_ratio_bothGenesets.pdf")
+  ggplot(cdf.data, aes(logTR, colour = sample)) +
+    stat_ecdf() +
+    theme_bw() +
+    theme(panel.grid = element_blank()) +
+    scale_color_brewer(palette = "Paired") +
+    ggtitle("Cumulative distribution of travelling ratio") +
+    xlab("log(travelling ratio)") +
+    ylab("proportion")
+dev.off()
+```
+
+# look at untranformed TR
+```{r}
+react.tr <- react.tss.mean/react.body.mean
+colnames(react.tr) <- gsub(".sort.dedup.bam", "", colnames(react.tr))
+# remove infinite values
+react.tr <- as.data.frame(react.tr[which(is.finite(react.tr[, 1])),])
+
+r.cdf.data <- data.frame()
+for(k in 1:4){
+  s.tr <- react.tr[, k]
+  s.cdf <- cbind(rep(gsub("_LATE", "_react", colnames(react.tr)[k]), length(s.tr)), s.tr)
+  r.cdf.data <- rbind(r.cdf.data, s.cdf)
+}
+colnames(r.cdf.data) <- c("sample", "TR")
+r.cdf.data$TR <- as.numeric(r.cdf.data$TR)
+
+non.react.tr <- non.react.tss.mean/non.react.body.mean
+colnames(non.react.tr) <- gsub(".sort.dedup.bam", "", colnames(non.react.tr))
+# remove infinite values
+non.react.tr <- as.data.frame(non.react.tr[which(is.finite(non.react.tr[, 1])),])
+
+nr.cdf.data <- data.frame()
+for(k in 1:4){
+  s.tr <- non.react.tr[, k]
+  s.cdf <- cbind(rep(gsub("_LATE", "_non-react", colnames(non.react.tr)[k]), length(s.tr)), s.tr)
+  nr.cdf.data <- rbind(nr.cdf.data, s.cdf)
+}
+colnames(nr.cdf.data) <- c("sample", "TR")
+nr.cdf.data$TR <- as.numeric(nr.cdf.data$TR)
+
+cdf.data <- rbind(r.cdf.data, nr.cdf.data)
+
+pdf("plots/CDF_TR_bothGenesets.pdf")
+  ggplot(cdf.data, aes(TR, colour = sample)) +
+    stat_ecdf() +
+    theme_bw() +
+    theme(panel.grid = element_blank()) +
+    scale_color_brewer(palette = "Paired") +
+    ggtitle("Cumulative distribution of travelling ratio") +
+    xlab("travelling ratio") +
+    ylab("proportion")
+dev.off()
+```
+
+# also have a look at TR for all genes
+```{r}
+# exclude any <300 bp
+all.300.bed <- dt.bed[-which((dt.bed$V3-dt.bed$V2) <= 300),]
+all.tss.saf <- data.frame(
+  "GeneID" = all.300.bed$V4,
+  "Chr" = all.300.bed$V1,
+  "Start" = all.300.bed$V2 - 30, 
+  "End" = all.300.bed$V2 + 300,
+  "Strand" = all.300.bed$V6
+)
+all.body.saf <- data.frame(
+  "GeneID" = all.300.bed$V4,
+  "Chr" = all.300.bed$V1,
+  "Start" = all.300.bed$V2 + 300, 
+  "End" = all.300.bed$V3,
+  "Strand" = all.300.bed$V6
+)
+
+# get counts over regions
+all.tss.counts <- featureCounts(
+  files = bam.files,
+  annot.ext = all.tss.saf,
+  largestOverlap = TRUE
+)
+all.body.counts <- featureCounts(
+  files = bam.files,
+  annot.ext = all.body.saf,
+  largestOverlap = TRUE
+)
+
+# normalise with TMM, batch corrected for all reads
+all.tss.norm <- as.matrix(all.tss.counts$counts) %*% diag(dge.counts$samples$lib.size/1000000)
+colnames(all.tss.norm) <- colnames(all.tss.counts$counts)
+
+all.body.norm <- as.matrix(all.body.counts$counts) %*% diag(dge.counts$samples$lib.size/1000000)
+colnames(all.body.norm) <- colnames(all.body.counts$counts)
+
+# get mean across replicates
+all.tss.mean <- data.frame(
+  "dD_LATE" = rowMeans(all.tss.norm[, grepl("dD", colnames(all.tss.norm))]), 
+  "dP_LATE" = rowMeans(all.tss.norm[, grepl("dP", colnames(all.tss.norm))]), 
+  "ND_LATE" = rowMeans(all.tss.norm[, grepl("ND", colnames(all.tss.norm))]),
+  "NP_LATE" = rowMeans(all.tss.norm[, grepl("NP", colnames(all.tss.norm))])
+  )
+
+all.body.mean <- data.frame(
+  "dD_LATE" = rowMeans(all.body.norm[, grepl("dD", colnames(all.body.norm))]), 
+  "dP_LATE" = rowMeans(all.body.norm[, grepl("dP", colnames(all.body.norm))]), 
+  "ND_LATE" = rowMeans(all.body.norm[, grepl("ND", colnames(all.body.norm))]),
+  "NP_LATE" = rowMeans(all.body.norm[, grepl("NP", colnames(all.body.norm))])
+  )
+
+# get ratio of TSS/body for each sample, use log scale for readability
+all.tr <- log10(all.tss.mean/all.body.mean)
+colnames(all.tr) <- gsub(".sort.dedup.bam", "", colnames(all.tr))
+# remove infinite values
+all.tr <- as.data.frame(all.tr[which(is.finite(all.tr[, 1])),])
+
+# log format for ggplots
+all.cdf.data <- data.frame()
+for(k in 1:4){
+  s.tr <- all.tr[, k]
+  s.cdf <- cbind(rep(gsub("_LATE", "_all", colnames(all.tr)[k]), length(s.tr)), s.tr)
+  all.cdf.data <- rbind(all.cdf.data, s.cdf)
+}
+colnames(all.cdf.data) <- c("sample", "logTR")
+all.cdf.data$logTR <- as.numeric(all.cdf.data$logTR)
+
+# make CDF plots
+pdf("plots/CDF_travelling_ratio_allGenes.pdf")
+  ggplot(all.cdf.data, aes(logTR, colour = sample)) +
+    stat_ecdf() +
+    theme_bw() +
+    theme(panel.grid = element_blank()) +
+    ggtitle("Cumulative distribution of travelling ratio") +
+    xlab("log(travelling ratio)") +
+    ylab("proportion")
+dev.off()
+```
+
+# make heatmaps of CGIs ranked by distance to TSS
+```{r}
+# build promoter ann
+prom.ann <- build_annotations(genome = "hg38", annotations = "hg38_genes_promoters")
+
+# get cpg ann
+cpg.ann <- fread("/data/reference/dawson_labs/bed_files/Hg38/CGI.bed")
+
+# save cpg ann as bed to use bedtools intersect
+prom.df <- data.frame(prom.ann)
+prom.bed <- prom.df[, c(1:3, 9, 7, 5)]
+
+# remove records with invalid start
+prom.bed <- prom.bed[-which(prom.bed$start <0),]
+
+write.table(
+  prom.bed,
+  "/data/reference/dawson_labs/bed_files/Hg38/promoters.bed",
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# use bedtools closest to find nearest CGI upstream of promoter and intersect to get prom w/CGI overlap
+```{bash}
+module load bedtools/2.27.1
+
+bedtools closest -id -D a -a /data/reference/dawson_labs/bed_files/Hg38/promoters_sorted.bed -b /data/reference/dawson_labs/bed_files/Hg38/CGI_sorted.bed > bed_files/promoters_closest_CGI.bed
+
+bedtools intersect -wo -a /data/reference/dawson_labs/bed_files/Hg38/promoters_sorted.bed -b /data/reference/dawson_labs/bed_files/Hg38/CGI_sorted.bed > bed_files/promoters_CGI_intersect.bed
+```
+
+# make file for heatmap
+```{r}
+prom.cgi <- fread("bed_files/promoters_CGI_intersect.bed")
+
+# limit above file to active genes (from nascent TTseq)
+nas.counts <- fread("../230420_TTseq/results/Nascent_batchcorrected_TMMnorm_counts.txt")
+
+# add transcript annotation for MANE txs to counts to merge w/proms
+mane.gene <- flattenGTF(
+  "/data/reference/dawson_labs/genomes/Hg38/MANE.GRCh38.v1.3.ensembl_genomic.gtf",
+  GTF.featureType = "transcript",
+  GTF.attrType = "gene_id"
+)
+mane.tx <- flattenGTF(
+  "/data/reference/dawson_labs/genomes/Hg38/MANE.GRCh38.v1.3.ensembl_genomic.gtf",
+  GTF.featureType = "transcript",
+  GTF.attrType = "transcript_id"
+)
+
+mane.ann <- merge(mane.gene, mane.tx, by = c("Chr", "Start", "End", "Strand"))
+colnames(mane.ann)[5:6] <- c("ENSG", "ENST")
+mane.ann$ENSG <- substr(mane.ann$ENSG, 1, 15)
+
+nas.counts <- merge(nas.counts, mane.ann, by.x = "V1", by.y = "ENSG")
+
+# limit to genes w/min ND exp, >2 reads in at least 3/4 reps
+keep <- which(rowSums(nas.counts[, c(4, 12:14)] > 2) >= 3)
+nd.exp <- nas.counts[keep, ]
+
+# keep only promoters with exp genes
+prom.cgi <- prom.cgi[which(prom.cgi$V5 %in% nd.exp$ENST), ]
+
+# make column of dist btw CGI end and prom end (TSS), account for strand
+prom.cgi$V11 <- ifelse(prom.cgi$V6 == "+", prom.cgi$V9 - prom.cgi$V3, prom.cgi$V2 - prom.cgi$V8)
+
+# rank by increasing TSS -> CGI end dist
+prom.cgi <- prom.cgi[order(prom.cgi$V11), ]
+
+# make bed centered on CGI end from above list for heatmap
+cgi.hm.bed <- cbind(
+  prom.cgi$V7,
+  ifelse(prom.cgi$V6 == "+", prom.cgi$V9 - 1, prom.cgi$V8 - 1),
+  ifelse(prom.cgi$V6 == "+", prom.cgi$V9 + 1, prom.cgi$V8 + 1),
+  prom.cgi$V4,
+  prom.cgi$V5,
+  prom.cgi$V6
+)
+
+# write out to use w/deeptools
+write.table(
+  cgi.hm.bed,
+  file.path(bed.dir, "CGI_promoter_distanceOrder_CGIendCentered.bed"),
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# make heatmap with above bed and another over intergenic ATAC increase as in chips and with MANE transcripts
+```{bash}
+sbatch scripts/DTMat_RefPoint_CGIprom_merged.sbatch
+sbatch scripts/DTMat_RefPoint_dTAG_ATACup_merged.sbatch
+sbatch scripts/DTMat_GeneRegion_pcGenes_merged.sbatch
+```
+
+# run fastq screen on raw (combined) & trimmed fastqs
+```{bash}
+mkdir fastq_screen
+mkdir trimmed_fastq_screen
+
+for fq in comb_fastq/*_comb.fastq.gz
+do
+sbatch scripts/fastq_screen.sbatch $fq
+done
+
+module load multiqc/1.8
+multiqc -n fastq_screen_multiqc_report.html ./*_screen
+```
+
+# merge Dm bams and get scale factors
+```{bash}
+sbatch scripts/mergeDmBamCov.sbatch bams/3dD_LATE_R1_S7.sort.dedup.Dm.bam bams/5dD_LATE_R1_S3.sort.dedup.Dm.bam dD_LATE
+sbatch scripts/mergeDmBamCov.sbatch bams/3dP_LATE_R1_S8.sort.dedup.Dm.bam bams/5dP_LATE_R1_S4.sort.dedup.Dm.bam dP_LATE
+sbatch scripts/mergeDmBamCov.sbatch bams/3ND_LATE_R1_S5.sort.dedup.Dm.bam bams/5ND_LATE_R1_S1.sort.dedup.Dm.bam ND_LATE
+sbatch scripts/mergeDmBamCov.sbatch bams/3NP_LATE_R1_S6.sort.dedup.Dm.bam bams/5NP_LATE_R1_S2.sort.dedup.Dm.bam NP_LATE
+```
+
+# scale factors calculation to plug in to the scripts below
+10000000/dm.counts
+```{bash}
+module load samtools/1.17
+
+samtools flagstat bams/dD_LATE.merged.sort.Dm.bam
+101345442 + 0 in total
+> 100000000/101345442
+[1] 0.9867242
+
+samtools flagstat bams/dP_LATE.merged.sort.Dm.bam
+96768461 + 0 in total
+> 100000000/96768461
+[1] 1.033395
+
+samtools flagstat bams/ND_LATE.merged.sort.Dm.bam
+94397581 + 0 in total
+> 100000000/94397581
+[1] 1.059349
+
+samtools flagstat bams/NP_LATE.merged.sort.Dm.bam
+119950597 + 0 in total
+> 100000000/119950597
+[1] 0.8336766
+```
+
+# make stranded bedgraphs and reverse strand also w/neg values
+```{bash}
+sbatch scripts/mergedBamToBedgraph.sbatch bams/dD_LATE.merged.sort.bam 0.9867242
+sbatch scripts/mergedBamToBedgraph.sbatch bams/dP_LATE.merged.sort.bam 1.033395
+sbatch scripts/mergedBamToBedgraph.sbatch bams/ND_LATE.merged.sort.bam 1.059349
+sbatch scripts/mergedBamToBedgraph.sbatch bams/NP_LATE.merged.sort.bam 0.8336766
+```
+
+# remake all genes & react genes heatmap & profile plot w/new mane annotation
+```{bash}
+sbatch scripts/DTMat_GeneRegion_allGenes_merged.sbatch
+sbatch scripts/DTMat_GeneRegion_reactGenes_merged.sbatch
+```
+
+# also make merged spike-in norm bigwigs and above plots
+```{bash}
+sbatch scripts/spikeinBamCov.sbatch bams/dD_LATE.merged.sort.bam 0.9867242
+sbatch scripts/spikeinBamCov.sbatch bams/dP_LATE.merged.sort.bam 1.033395
+sbatch scripts/spikeinBamCov.sbatch bams/ND_LATE.merged.sort.bam 1.059349
+sbatch scripts/spikeinBamCov.sbatch bams/NP_LATE.merged.sort.bam 0.8336766
+
+sbatch scripts/DTMat_GeneRegion_allGenes_merged_spikeinnorm.sbatch
+sbatch scripts/DTMat_GeneRegion_reactGenes_merged_spikeinnorm.sbatch
+```
+
+# make bigwigs in 50bp bins for elong velocity analysis
+```{bash}
+for bam in bams/*merged.sort.bam
+do
+sbatch scripts/binSize50BamCov.sbatch $bam
+done
+```
+
+# make LFC plots TSS as ref point and order by gene length
+```{bash}
+sbatch scripts/DTMat_RefPoint_reactGenes_LFC_merged.sbatch
+sbatch scripts/DTMat_RefPoint_nonreactGenes_LFC_merged.sbatch
+sbatch scripts/DTMat_RefPoint_MANEGenes_LFC_merged.sbatch
+```
+
+# make TSS refpoint plots for coverage 
+```{bash}
+sbatch scripts/DTMat_RefPoint_reactGenes_merged.sbatch
+sbatch scripts/DTMat_RefPoint_nonreactGenes_merged.sbatch
+sbatch scripts/DTMat_RefPoint_MANEGenes_merged.sbatch
+```
+
+
+# save session info
+```{r}
+sesh.info <- capture.output(sessionInfo())
+writeLines(
+  sesh.info,
+  file.path(project.dir, "session-info", paste0(Sys.Date(), "_PROseq_230427.txt"))
+)
+```
