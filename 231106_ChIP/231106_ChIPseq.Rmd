@@ -1,0 +1,393 @@
+---
+title: "ChIPseq_231106"
+author: "Andrea"
+date: "2023/11/10"
+output: html_document
+---
+
+fastq location: /pipeline/Runs/NextSeq/231106_VH01624_36_AACYY2CM5/ProjectFolders/Project_Jesse-Balic/
+project directory: /dawson_genomics/Projects/MYC/231106_ChIP/
+
+# set up project dir and process (fastqc, trim, align, tdfs)
+```{bash}
+mkdir alignment
+mkdir fastqc
+mkdir trimmed_fastqs
+mkdir logs
+mkdir scripts
+mkdir tdfs
+
+for fq in /pipeline/Runs/NextSeq/231106_VH01624_36_AACYY2CM5/ProjectFolders/Project_Jesse-Balic/Sample*/*_R1_001.fastq.gz
+do
+sbatch scripts/alignHg38.sbatch $fq
+done
+
+module load multiqc/1.8
+multiqc .
+```
+
+# peak calling (both narrow and broad) include bedgraph output for Spark plots and diff peaks if needed
+```{bash}
+mkdir macs/narrowpeaks
+mkdir macs/broadpeaks
+
+for bam in alignment/R[1-3]*untreated*sort.rmdup.bam
+do
+sbatch scripts/macs2.sbatch $bam alignment/Input-R1-untreated_S5.sort.rmdup.bam
+done
+
+for bam in alignment/R[1-3]-A485*sort.rmdup.bam
+do
+sbatch scripts/macs2.sbatch $bam alignment/Input-R1-A485_S7.sort.rmdup.bam
+done
+
+for bam in alignment/R[1-3]-dTAG-and-A485*sort.rmdup.bam
+do
+sbatch scripts/macs2.sbatch $bam alignment/Input-R1-dTAG-and-A485_S8.sort.rmdup.bam
+done
+
+for bam in alignment/R[1-3]-dTAG_S*sort.rmdup.bam
+do
+sbatch scripts/macs2.sbatch $bam alignment/Input-R1-dTAG_S6.sort.rmdup.bam
+done
+```
+
+# make bigwigs for all samples
+```{bash}
+for bam in alignment/*sort.rmdup.bam
+do
+sbatch scripts/DeeptoolsBamCov.sbatch $bam
+done
+```
+
+# make genome wide gene region heatmaps for all
+```{bash}
+sbatch scripts/DTMatrix_P300_allGenes.sbatch
+```
+
+# check for overlap between P300 peaks and superenhancers
+```{bash}
+module load bedtools/2.27.1
+
+for peak in macs/broadpeaks/*broadPeak
+do
+bname=`basename $peak _peaks.broadPeak`
+bedtools intersect -a /dawson_genomics/Projects/MYC/230420_TTseq/bed_files/K562_ENCODE_sedb_01_0039.bed -b $peak -wa -c > bed_files/${bname}_SEcounts.bed
+done
+```
+
+# set up R env
+```{r}
+library(data.table)
+library(Rsubread)
+library(ComplexHeatmap)
+library(UpSetR)
+
+project.dir <- file.path("/dawson_genomics/Projects/MYC/231106_ChIP")
+peak.dir <- file.path(project.dir, "macs/broadpeaks")
+bed.dir <- file.path(project.dir, "bed_files")
+res.dir <- file.path(project.dir, "results")
+bam.dir <- file.path(project.dir, "alignment")
+```
+
+# make counts matrix from bed files
+```{r}
+counts.files <- list.files(bed.dir, full.names = TRUE, pattern = "_SEcounts.bed")
+
+se.counts <- fread(counts.files[1])
+for(i in 2:length(counts.files)){
+  cf <- fread(counts.files[i])
+  se.counts <- cbind(se.counts, cf[, 5])
+}
+colnames(se.counts) <- c("chr", "start", "end", "SE", gsub("_SEcounts.bed", "", basename(counts.files)))
+
+write.table(
+  se.counts,
+  file.path(res.dir, "superenhancer_peak_counts.txt"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# number of peaks may not be the best way to look at this, look at reads in SE and make heatmap
+```{r}
+# make saf from super enhancer bed and get counts
+se.bed <- fread("/dawson_genomics/Projects/MYC/230420_TTseq/bed_files/K562_ENCODE_sedb_01_0039.bed")
+se.saf <-data.frame(
+  "GeneID" = se.bed$V4, 
+  "Chr" = se.bed$V1, 
+  "Start" = se.bed$V2, 
+  "End" = se.bed$V3, 
+  "Strand" = "."
+  )
+
+bam.files <- list.files(bam.dir, pattern = "sort.rmdup.bam$", full.names = TRUE)
+
+se.read.counts <- featureCounts(
+  bam.files,
+  annot.ext = se.saf,
+  allowMultiOverlap = FALSE,
+  largestOverlap = TRUE, 
+  isPairedEnd = FALSE
+)
+colnames(se.read.counts$counts) <- gsub(".sort.rmdup.bam", "", colnames(se.read.counts$counts))
+```
+
+# make DT heatmaps centered on super enhancers
+```{bash}
+sbatch scripts/DTMatrix_P300_superEnhancers.sbatch
+```
+
+# convert MACS bedgraphs to bigwigs as in C&R
+
+```{bash}
+for bdg in macs/broadpeaks/*_treat_pileup.bdg
+do
+sbatch scripts/bedgraphToBigwig.sbatch $bdg
+done
+```
+
+# make heatmaps with MACS norm bigwigs also
+```{bash}
+sbatch scripts/DTMatrix_P300_superEnhancers_MACSnorm.sbatch
+sbatch scripts/DTMatrix_P300_allGenes_MACSnorm.sbatch
+```
+
+# rep 1 of combo treatment was poor so just use reps 2&3 for now, combine and get macs norm bigwigs for further heatmaps
+```{bash}
+module load macs/2.2.7.1
+cd macs/broadpeaks
+
+macs2 cmbreps -i R2-A485_S15_treat_pileup.bdg R3-A485_S2_treat_pileup.bdg -m mean -o A485_treat_pileup.bdg
+macs2 cmbreps -i R2-dTAG-and-A485_S16_treat_pileup.bdg R3-dTAG-and-A485_S3_treat_pileup.bdg -m mean -o dTAG-and-A485_treat_pileup.bdg
+macs2 cmbreps -i R2-dTAG_S14_treat_pileup.bdg R3-dTAG_S1_treat_pileup.bdg -m mean -o dTAG_treat_pileup.bdg
+macs2 cmbreps -i R2-untreated_S13_treat_pileup.bdg R3-untreated_S17_treat_pileup.bdg -m mean -o untreated_treat_pileup.bdg
+
+macs2 cmbreps -i R2-A485_S15_control_lambda.bdg R3-A485_S2_control_lambda.bdg -m mean -o A485_control_lambda.bdg
+macs2 cmbreps -i R2-dTAG-and-A485_S16_control_lambda.bdg R3-dTAG-and-A485_S3_control_lambda.bdg -m mean -o dTAG-and-A485_control_lambda.bdg
+macs2 cmbreps -i R2-dTAG_S14_control_lambda.bdg R3-dTAG_S1_control_lambda.bdg -m mean -o dTAG_control_lambda.bdg
+macs2 cmbreps -i R2-untreated_S13_control_lambda.bdg R3-untreated_S17_control_lambda.bdg -m mean -o untreated_control_lambda.bdg
+
+sbatch scripts/bedgraphToBigwig.sbatch macs/broadpeaks/A485_treat_pileup.bdg
+sbatch scripts/bedgraphToBigwig.sbatch macs/broadpeaks/dTAG-and-A485_treat_pileup.bdg
+sbatch scripts/bedgraphToBigwig.sbatch macs/broadpeaks/dTAG_treat_pileup.bdg
+sbatch scripts/bedgraphToBigwig.sbatch macs/broadpeaks/untreated_treat_pileup.bdg
+
+# now make heatmap w/new bigwigs
+sbatch scripts/DTMatrix_P300_2genelists_MACSnorm.sbatch
+
+# and another for intergenic increased access w/dTAG
+sbatch scripts/DTMatrix_P300_dTAG_ATACup_MACSnorm.sbatch
+```
+
+# look at what happens genome wide with dTAG, try clustering for patterns
+```{bash}
+sbatch scripts/DTMatrix_P300_allGenes_merged_MACSnorm.sbatch
+```
+
+# get differential comp of dTAGvND to make heatmaps of sig up & down
+# diffpeak calling
+```{bash}
+dname=macs/broadpeaks
+
+sbatch scripts/bdgdiff.sbatch ${dname}/dTAG_treat_pileup.bdg ${dname}/dTAG_control_lambda.bdg ${dname}/untreated_treat_pileup.bdg ${dname}/untreated_control_lambda.bdg dDvND
+sbatch scripts/bdgdiff.sbatch ${dname}/A485_treat_pileup.bdg ${dname}/A485_control_lambda.bdg ${dname}/untreated_treat_pileup.bdg ${dname}/untreated_control_lambda.bdg NPvND
+sbatch scripts/bdgdiff.sbatch ${dname}/dTAG-and-A485_treat_pileup.bdg ${dname}/dTAG-and-A485_control_lambda.bdg ${dname}/A485_treat_pileup.bdg ${dname}/A485_control_lambda.bdg dPvNP
+```
+
+# make heatmap of diff peaks
+```{bash}
+sbatch scripts/DTMatrix_P300_dDvND_merged_MACSnorm.sbatch
+```
+
+# get top peaks in each condition for motif enrichment, first merge replicate peaks files getting mean -log10(q) across reps
+```{bash}
+# cat reps together and sort 
+dname=macs/broadpeaks
+cat ${dname}/R1-A485_S11_peaks.broadPeak ${dname}/R2-A485_S15_peaks.broadPeak ${dname}/R3-A485_S2_peaks.broadPeak > ${dname}/A485_peaks_all.bed
+cat ${dname}/R1-dTAG-and-A485_S12_peaks.broadPeak ${dname}/R2-dTAG-and-A485_S16_peaks.broadPeak ${dname}/R3-dTAG-and-A485_S3_peaks.broadPeak > ${dname}/dTAG-and-A485_peaks_all.bed
+cat ${dname}/R1-dTAG_S10_peaks.broadPeak ${dname}/R2-dTAG_S14_peaks.broadPeak ${dname}/R3-dTAG_S1_peaks.broadPeak > ${dname}/dTAG_peaks_all.bed
+cat ${dname}/R1-untreated_S9_peaks.broadPeak ${dname}/R2-untreated_S13_peaks.broadPeak ${dname}/R3-untreated_S17_peaks.broadPeak > ${dname}/untreated_peaks_all.bed
+
+sort -k1,1 -k2,2n ${dname}/A485_peaks_all.bed > ${dname}/A485_peaks_all_sorted.bed
+sort -k1,1 -k2,2n ${dname}/dTAG-and-A485_peaks_all.bed > ${dname}/dTAG-and-A485_peaks_all_sorted.bed
+sort -k1,1 -k2,2n ${dname}/dTAG_peaks_all.bed > ${dname}/dTAG_peaks_all_sorted.bed
+sort -k1,1 -k2,2n ${dname}/untreated_peaks_all.bed > ${dname}/untreated_peaks_all_sorted.bed
+
+module load bedtools/2.27.1
+
+bedtools merge -i ${dname}/A485_peaks_all_sorted.bed -c 9 -o mean > ${dname}/A485_peaks_meanQvalue_sorted.bed
+bedtools merge -i ${dname}/dTAG-and-A485_peaks_all_sorted.bed -c 9 -o mean > ${dname}/dTAG-and-A485_peaks_meanQvalue_sorted.bed
+bedtools merge -i ${dname}/dTAG_peaks_all_sorted.bed -c 9 -o mean > ${dname}/dTAG_peaks_meanQvalue_sorted.bed
+bedtools merge -i ${dname}/untreated_peaks_all_sorted.bed -c 9 -o mean > ${dname}/untreated_peaks_meanQvalue_sorted.bed
+```
+
+# make homer compatible bed of top 5%
+```{r}
+nd.peaks <- fread("macs/broadpeaks/untreated_peaks_meanQvalue_sorted.bed")
+dd.peaks <- fread("macs/broadpeaks/dTAG_peaks_meanQvalue_sorted.bed")
+np.peaks <- fread("macs/broadpeaks/A485_peaks_meanQvalue_sorted.bed")
+dp.peaks <- fread("macs/broadpeaks/dTAG-and-A485_peaks_meanQvalue_sorted.bed")
+
+# order by -log10(qvalue)
+nd.peaks <- nd.peaks[order(nd.peaks$V4, decreasing = TRUE), ]
+dd.peaks <- dd.peaks[order(dd.peaks$V4, decreasing = TRUE), ]
+np.peaks <- np.peaks[order(np.peaks$V4, decreasing = TRUE), ]
+dp.peaks <- dp.peaks[order(dp.peaks$V4, decreasing = TRUE), ]
+
+# get top 5%
+nd.top <- nd.peaks[1:round(nrow(nd.peaks)/20, 0), ]
+dd.top <- dd.peaks[1:round(nrow(dd.peaks)/20, 0), ]
+np.top <- np.peaks[1:round(nrow(np.peaks)/20, 0), ]
+dp.top <- dp.peaks[1:round(nrow(dp.peaks)/20, 0), ]
+
+nd.top.bed <- cbind(paste0("chr", nd.top$V1), nd.top$V2, nd.top$V3, paste0("peak_", 1:nrow(nd.top)), nd.top$V4, ".")
+dd.top.bed <- cbind(paste0("chr", dd.top$V1), dd.top$V2, dd.top$V3, paste0("peak_", 1:nrow(dd.top)), dd.top$V4, ".")
+np.top.bed <- cbind(paste0("chr", np.top$V1), np.top$V2, np.top$V3, paste0("peak_", 1:nrow(np.top)), np.top$V4, ".")
+dp.top.bed <- cbind(paste0("chr", dp.top$V1), dp.top$V2, dp.top$V3, paste0("peak_", 1:nrow(dp.top)), dp.top$V4, ".")
+
+write.table(
+  nd.top.bed,
+  "bed_files/untreated_top5p_homer.bed", 
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+write.table(
+  dd.top.bed,
+  "bed_files/dTAG_top5p_homer.bed", 
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+write.table(
+  np.top.bed,
+  "bed_files/A485_top5p_homer.bed", 
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+write.table(
+  dp.top.bed,
+  "bed_files/dTAG-and-A485_top5p_homer.bed", 
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# run homer on top peaks files
+```{bash}
+mkdir homer
+
+for bed in bed_files/*_top5p_homer.bed
+do
+sbatch scripts/homer.sbatch $bed
+done
+```
+
+# make bed of TSS +/-1 to make TSS centered heatmap
+```{r}
+all.bed <- fread("/data/reference/dawson_labs/bed_files/Hg38/Hg38EnsGeneStrandPlusMinusWhitelist.bed")
+tss.bed <- cbind(all.bed$V1, all.bed$V2-1, all.bed$V2+1, all.bed$V4, all.bed$V5, all.bed$V6)
+write.table(
+  tss.bed,
+  "/data/reference/dawson_labs/bed_files/Hg38/Hg38EnsTSSStrandPlusMinusWhitelist.bed",
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+
+# also make for MANE protein coding transcripts
+mane.bed <- fread("/data/reference/dawson_labs/bed_files/Hg38/Hg38_MANE_ProteinCoding.bed")
+mane.tss.bed <- cbind(mane.bed$V1, mane.bed$V2-1, mane.bed$V2+1, mane.bed$V4, mane.bed$V5, mane.bed$V6)
+write.table(
+  mane.tss.bed,
+  "/data/reference/dawson_labs/bed_files/Hg38/Hg38_MANE_ProteinCoding_TSS.bed",
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+```{bash}
+sbatch scripts/DTMatrix_P300_allGenes_merged_TSSrefpoint.sbatch
+```
+
+# make heatmap over ATAC up/down, SEs & TSS
+```{bash}
+sbatch scripts/DTMatrix_P300_4lists_merged_MACSnorm.sbatch
+```
+
+# merge bams from ENCODE & convert to bigwigs for heatmaps
+```{bash}
+sbatch scripts/mergeBams.sbatch ENCODE/K562_MED1_Hg38_merged_HAIB.bam ENCODE/K562_MED1_Hg38_Rep1_HAIB.bam ENCODE/K562_MED1_Hg38_Rep1_HAIB.bam
+sbatch scripts/mergeBams.sbatch ENCODE/K562_BRD4_Hg38_merged_Broad.bam ENCODE/K562_BRD4_Hg38_rep1_Broad.bam ENCODE/K562_BRD4_Hg38_Rep2_Broad.bam
+
+for bam in ENCODE/*merged*bam
+do
+sbatch scripts/DeeptoolsBamCov.sbatch $bam
+done
+
+# make heatmaps as 4 lists above (EXCEPT for using MANE protein coding TSS only) also with traditional enhancers
+sbatch scripts/DTMatrix_P300_ENCODE_5lists_merged_MACSnorm.sbatch
+
+# also add in PROseq data
+sbatch scripts/DTMatrix_P300_ENCODE_PROseq_5lists_merged_MACSnorm.sbatch
+
+# swap SE & TE lists above for prox/dist SS & TE lists
+sbatch scripts/DTMatrix_P300_ENCODE_PROseq_7lists_merged_MACSnorm.sbatch
+
+# now with merged SE lists
+sbatch scripts/DTMatrix_P300_ENCODE_PROseq_6lists_merged_MACSnorm.sbatch
+
+# same as last plot, but P300 only, sorted by combo & write out order for other heatmaps
+sbatch scripts/DTMatrix_P300_6lists_merged_MACSnorm.sbatch
+```
+
+# make new MANE TSS bed w/ updated annotation file
+```{r}
+# also make for MANE protein coding transcripts
+mane.bed <- fread("/dawson_genomics/Projects/MYC/annotations/mane.expressed.prot.coding.genes.hg38.bed")
+mane.tss.bed <- cbind(mane.bed$V1, mane.bed$V2-1, mane.bed$V2+1, mane.bed$V4, mane.bed$V5, mane.bed$V6)
+write.table(
+  mane.tss.bed,
+  "/data/reference/dawson_labs/bed_files/Hg38/Hg38_MANE_ProteinCoding_TSS_240823.bed",
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# merge bams and get RPGC norm bigwigs
+```{bash}
+sbatch scripts/mergeBamCov.sbatch R1-A485_S11.sort.rmdup.bam R2-A485_S15.sort.rmdup.bam R3-A485_S2.sort.rmdup.bam A485
+sbatch scripts/mergeBamCov.sbatch R1-dTAG-and-A485_S12.sort.rmdup.bam R2-dTAG-and-A485_S16.sort.rmdup.bam R3-dTAG-and-A485_S3.sort.rmdup.bam dTAG-and-A485
+sbatch scripts/mergeBamCov.sbatch R1-dTAG_S10.sort.rmdup.bam R2-dTAG_S14.sort.rmdup.bam R3-dTAG_S1.sort.rmdup.bam dTAG
+sbatch scripts/mergeBamCov.sbatch R1-untreated_S9.sort.rmdup.bam R2-untreated_S13.sort.rmdup.bam R3-untreated_S17.sort.rmdup.bam untreated
+```
+
+# remake all genes & 6 list plots w/updated mane annotation
+```{bash}
+sbatch scripts/DTMatrix_P300_6lists_merged_RPGCnorm.sbatch
+sbatch scripts/DTMatrix_P300_allGenes_merged_TSSrefpoint.sbatch
+```
+
+
+# save session info
+```{r}
+sesh.info <- capture.output(sessionInfo())
+writeLines(
+  sesh.info,
+  file.path(project.dir, "session-info", paste0(Sys.Date(), "_ChIPseq_231106.txt"))
+)
+```
