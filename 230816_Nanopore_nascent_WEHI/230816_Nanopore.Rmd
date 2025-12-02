@@ -1,0 +1,278 @@
+---
+title: "230816_Nanopore"
+author: "Andrea"
+date: '2023-10-27'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+fastq dirs: 
+  /dawson_genomics/Projects/MYC/230816_Nanopore_nascent_WEHI/raw_data/Run1
+  /dawson_genomics/Projects/MYC/230816_Nanopore_nascent_WEHI/raw_data/Run2
+scratch dir: /scratch/teams/dawson_genomics/Projects/MYC/230816_Nanopore_nascent_WEHI/nf-core_nanoseq
+
+# to use nf-core pipeline all fastqs for each sample should be in same dir so copy Run2 to Run1 barcode dirs
+```{bash}
+for barcode in raw_data/Run2/TTseqextraRun/20230821_1103_2E_PAQ61146_28bbfbd1/fastq_pass/*
+do
+bname=`basename $barcode`
+cp -iv $barcode/* raw_data/Run1/TTpool/20230816_1301_2E_PAQ61146_13980f4f/fastq_pass/$bname
+done
+```
+
+# nfcore doesn't like dir structure, so add fastq dir to each barcode dir to make pipeline happy
+```{bash}
+for fqdir in raw_data/Run1/TTpool/20230816_1301_2E_PAQ61146_13980f4f/fastq_pass/*
+do
+mkdir $fqdir/fastq
+mv -v $fqdir/* $fqdir/fastq
+done
+```
+
+# pipeline still not happy, need to cat all fastqs into a single fastq for each sample
+```{bash}
+for fqdir in raw_data/Run1/TTpool/20230816_1301_2E_PAQ61146_13980f4f/fastq_pass/*
+do
+bname=`basename $fqdir`
+cat $fqdir/fastq/*fastq.gz > $fqdir/${bname}.fastq.gz
+done
+```
+
+# run nf-core pipeline w/ output to scratch
+```{bash}
+sbatch scripts/run_nfcore-nanoseq.sbatch
+```
+
+# nf-core data looks good, transferred to dawson_genomics
+
+# load libraries 
+```{r}
+library(data.table)
+library(Gviz)
+library(ggplot2)
+```
+
+# set paths
+```{r}
+project.dir <- "/dawson_genomics/Projects/MYC/230816_Nanopore_nascent_WEHI"
+align.dir <- file.path(project.dir, "nf-core_nanoseq/minimap2")
+plots.dir <- file.path(project.dir, "plots")
+```
+
+# minimap2 includes secondary alignments which will not work with Gviz, so make separate bams with supplementary alignments filtered
+```{bash}
+for bam in nf-core_nanoseq/minimap2/*bam
+do
+sbatch scripts/filter_secondary_alignment.sbatch $bam
+done
+```
+
+# make sashimi plot at MYC locus
+```{r}
+bam.files <- list.files(file.path(project.dir, "bams_no_supp"), pattern = "filtered.bam$", full.names = TRUE)
+
+# create objects for Gviz
+locus <- list(
+	chr = 'chr8',
+	start = 127735000,
+	end = 127743000
+	)
+
+align.tracks <- lapply(
+	bam.files[c(1,4,7,9)],
+	function(bam.file) {
+		align.track <- AlignmentsTrack(
+			bam.file,
+			isPaired = FALSE,
+			name = bnames <- gsub(".filtered.bam", "", basename(bam.file))
+			)
+		return(align.track)
+	}
+)
+
+genes.track <- GeneRegionTrack(
+    "/data/reference/dawson_labs/genomes/GRCh38/GCA_000001405.15_GRCh38_full_analysis_set.refseq_annotation.gtf",
+    chromosome = locus$chr, 
+    start = locus$start, 
+    end = locus$end,
+    stacking = "squish",
+    stackHeight = 0.3,
+    name = "RefSeq",
+    ucscChromosomeNames = FALSE
+    )
+
+ideo.track <- IdeogramTrack(genome = "hg38", chromosome = "chr8")
+
+axis.track <- GenomeAxisTrack()
+
+# make Gviz sashimi plot
+pdf(file.path(plots.dir, "sashimiPlot_MYC.pdf"), height = 160, width = 8)
+plotTracks(
+  c(axis.track, genes.track, align.tracks),
+#  align.tracks,
+  from = locus$start,
+  to = locus$end,
+  chromosome = locus$chr,
+  type = c("coverage", "sashimi"),
+  sashimiScore = 10
+  )
+dev.off()
+```
+
+# make tsvs of bams and colours for ggsashimi plots
+```{r}
+sash.bams <- data.frame(
+  "ID" = gsub(".filtered.bam", "", basename(bam.files)), 
+  "bams" = bam.files, 
+  "group" = as.factor(gsub("_R[1-3].filtered.bam", "", basename(bam.files)))
+  )
+write.table(
+  sash.bams,
+  "results/sashimi_bams.tsv",
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+
+sash.col <- rbind("firebrick3", "forestgreen", "darkorange2", "dodgerblue3")
+writeLines(sash.col, "results/sashimi_cols.tsv")
+```
+
+# make ggsashimi at MYC
+```{bash}
+module load R/4.2.0
+module load pysam/0.91
+
+scripts/ggsashimi.py -b results/sashimi_bams.tsv -c chr8:127735000-127743000 -M 20 -o plots/sashimi_MYC_allReps.pdf -C 3 -P results/sashimi_cols.tsv --alpha 0.8 -g /data/reference/dawson_labs/genomes/GRCh38/GCA_000001405.15_GRCh38_full_analysis_set.refseq_annotation.gtf 
+
+scripts/ggsashimi.py -b results/sashimi_bams.tsv -c chr8:127735000-127743000 -M 20 -o plots/sashimi_MYC_groupedReps.pdf -O 3 -C 3 -P results/sashimi_cols.tsv --alpha 0.5 -g /data/reference/dawson_labs/genomes/GRCh38/GCA_000001405.15_GRCh38_full_analysis_set.refseq_annotation.gtf 
+
+scripts/ggsashimi.py -b results/sashimi_bams.tsv -c chr8:127735000-127743000 -M 20 -o plots/sashimi_MYC_groupedReps_fixy.pdf -O 3 -C 3 -P results/sashimi_cols.tsv --alpha 0.2 -g /data/reference/dawson_labs/genomes/GRCh38/GCA_000001405.15_GRCh38_full_analysis_set.refseq_annotation.gtf --fix-y-scale
+
+scripts/ggsashimi.py -b results/sashimi_bams.tsv -c chr8:127735000-127743000 -M 100 -o plots/sashimi_MYC_groupedReps_min100.pdf -O 3 -C 3 -P results/sashimi_cols.tsv --alpha 0.2 -g /data/reference/dawson_labs/genomes/GRCh38/GCA_000001405.15_GRCh38_full_analysis_set.refseq_annotation.gtf -c -m temp -f 
+```
+
+# run calculate PSI script
+```{bash}
+module load bedtools/2.21
+module load gcc/8.2.0
+module load bowtie2/2.2.9
+module load tophat2/2.1.1
+module load R/4.0.2
+module load samtools/1.3.1
+
+~/calculate-PSI/get-psi-byIndi.sh -e G -g MYC -b scripts/dDvND_bamlist.txt -c -f /data/reference/dawson_labs/genomes/GRCh38/GCA_000001405.15_GRCh38_full_analysis_set.refseq_annotation.gtf -m temp -n /data/reference/dawson_labs/genomes/Hg38/Homo_sapiens.GRCh38.dna.toplevel.fa -o results/MYC_dDvND_PSI -p -r 1000
+```
+
+# get splicing index (2*spliced reads/unspliced reads) per gene and make boxplot per sample
+# start with % spliced
+```{bash}
+# get spliced and unspliced reads for each sample
+module load samtools/1.3.1
+
+samtools view bams_no_supp/ND_R1.filtered.bam  |  awk '($6 ~ /N/)' | cut -f1 | wc -l
+4019479
+samtools flagstat bams_no_supp/ND_R1.filtered.bam
+9951364
+> 4019479/9951364
+[1] 0.4039124
+
+samtools view bams_no_supp/ND_R2.filtered.bam  |  awk '($6 ~ /N/)' | cut -f1 | wc -l
+2575638
+samtools flagstat bams_no_supp/ND_R2.filtered.bam
+12741536
+> 2575638/12741536
+[1] 0.202145
+
+samtools view bams_no_supp/NP_R1.filtered.bam  |  awk '($6 ~ /N/)' | cut -f1 | wc -l
+2693582
+samtools flagstat bams_no_supp/NP_R1.filtered.bam 
+7224701
+> 2693582/7224701
+[1] 0.3728295
+
+samtools view bams_no_supp/NP_R2.filtered.bam  |  awk '($6 ~ /N/)' | cut -f1 | wc -l
+878775
+samtools flagstat bams_no_supp/NP_R2.filtered.bam
+5312608
+> 878775/5312608
+[1] 0.1654131
+
+samtools view bams_no_supp/NP_R3.filtered.bam  |  awk '($6 ~ /N/)' | cut -f1 | wc -l
+3713828
+samtools flagstat bams_no_supp/NP_R3.filtered.bam
+11135533
+> 3713828/11135533
+[1] 0.3335115
+
+samtools view bams_no_supp/dD_R1.filtered.bam  |  awk '($6 ~ /N/)' | cut -f1 | wc -l
+2176291
+samtools flagstat bams_no_supp/dD_R1.filtered.bam 
+6818056
+> 2176291/6818056
+[1] 0.3191952
+
+samtools view bams_no_supp/dD_R2.filtered.bam  |  awk '($6 ~ /N/)' | cut -f1 | wc -l
+2638477
+samtools flagstat bams_no_supp/dD_R2.filtered.bam
+12972738 
+> 2638477/12972738
+[1] 0.2033863
+
+samtools view bams_no_supp/dD_R3.filtered.bam  |  awk '($6 ~ /N/)' | cut -f1 | wc -l
+2335191
+samtools flagstat bams_no_supp/dD_R3.filtered.bam
+8093710
+> 2335191/8093710
+[1] 0.2885192
+
+samtools view bams_no_supp/dP_R1.filtered.bam  |  awk '($6 ~ /N/)' | cut -f1 | wc -l
+2247237
+samtools flagstat bams_no_supp/dP_R1.filtered.bam 
+8388369
+> 2247237/8388369
+[1] 0.2678992
+
+samtools view bams_no_supp/dP_R2.filtered.bam  |  awk '($6 ~ /N/)' | cut -f1 | wc -l
+2899623
+samtools flagstat bams_no_supp/dP_R2.filtered.bam
+8473498
+> 2899623/8473498
+[1] 0.3421991
+
+samtools view bams_no_supp/dP_R3.filtered.bam  |  awk '($6 ~ /N/)' | cut -f1 | wc -l
+2096180
+samtools flagstat bams_no_supp/dP_R3.filtered.bam
+10177643
+> 2096180/10177643
+[1] 0.2059593
+```
+
+# make dot plot of percent spliced (spliced reads/unspliced reads)
+```{r}
+dot.data <- data.frame(
+ "spliced" = c(40.39, 20.21, 37.28, 16.54, 33.35, 31.92, 20.34, 28.85, 26.79, 34.22, 20.60),
+ "group" = factor(c(rep("ND", 2), rep("NP", 3), rep("dD", 3), rep("dP", 3)), levels = c("ND", "NP", "dD", "dP"))
+)
+
+pdf(file.path(plots.dir, "dotplot_percentSpliced_Nanopore.pdf"))
+ggplot(dot.data, aes(x = group, y = spliced, fill = group)) + 
+  geom_dotplot(binaxis = "y", stackdir = "center")+
+  labs(y = "percent spliced", x = "", title = "Nanopore % spliced reads") +
+  theme_classic()
+dev.off()
+```
+
+
+# save session info
+```{r}
+sesh.info <- capture.output(sessionInfo())
+writeLines(
+  sesh.info,
+  file.path(project.dir, "session-info", paste0(Sys.Date(), "_Nanopore_230816.txt"))
+)
+```
