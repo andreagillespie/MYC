@@ -1,0 +1,39 @@
+---
+title: "ChIPseq_231110"
+author: "Andrea"
+date: "2023/11/15"
+output: html_document
+---
+
+fastq location: /pipeline/Runs/NextSeq/231110_VH01624_37_AAC7LYNHV/ProjectFolders/Project_Jesse-Balic/
+project directory: /dawson_genomics/Projects/MYC/231110_ChIP/
+
+# set up project dir and process (fastqc, trim, align, tdfs)
+```{bash}
+mkdir alignment
+mkdir fastqc
+mkdir trimmed_fastqs
+mkdir logs
+mkdir scripts
+mkdir tdfs
+
+for fq in /pipeline/Runs/NextSeq/231110_VH01624_37_AAC7LYNHV/ProjectFolders/Project_Jesse-Balic/Sample*/*_R1_001.fastq.gz
+do
+sbatch scripts/alignHg38.sbatch $fq
+done
+
+module load multiqc/1.8
+multiqc .
+```
+
+# peak calling (both narrow and broad) include bedgraph output for Spark plots and diff peaks if needed
+```{bash}
+mkdir macs/narrowpeaks
+mkdir macs/broadpeaks
+
+for bam in alignment/*[P\|0-9]_S[0-9][0-9].sort.rmdup.bam
+do
+sbatch scripts/macs2.sbatch $bam alignment/IgG_S41.sort.rmdup.bam
+done
+```
+
