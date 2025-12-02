@@ -1,0 +1,3470 @@
+---
+title: "230420_TTseq"
+author: "Andrea"
+date: "2023-04-23"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+fastq dir: /pipeline/Runs/NovaSeq/230420_A01524_0115_AH7FGKDSX7/ProjectFolders/Project_Dane-Vassiliadis/Sample_[3-5]*/
+scratch dir: /scratch/teams/dawson_genomics/Projects/MYC/230420_TTseq
+project dir: /dawson_genomics/Projects/MYC/230420_TTseq
+
+# fastqc first
+```{bash}
+mkdir fastqc
+mkdir scripts
+mkdir logs
+mkdir session-info
+
+for fq in /pipeline/Runs/NovaSeq/230420_A01524_0115_AH7FGKDSX7/ProjectFolders/Project_Dane-Vassiliadis/Sample_[3-5]*/*L002_R1_001.fastq.gz
+do
+bname=`basename $fq L002_R1_001.fastq.gz`
+dname=`dirname $fq`
+sbatch scripts/fastqc.sbatch $fq ${dname}/${bname}L002_R2_001.fastq.gz ${dname}/${bname}L003_R1_001.fastq.gz ${dname}/${bname}L003_R2_001.fastq.gz
+done
+
+# 2 of the samples timed out at an hour, so I doubled the time limit to 2hrs in the script and reran for just those 2
+fq=/pipeline/Runs/NovaSeq/230420_A01524_0115_AH7FGKDSX7/ProjectFolders/Project_Dane-Vassiliadis/Sample_3dP-1-Nascent/3dP-1-Nascent_S420_L002_R1_001.fastq.gz
+bname=`basename $fq L002_R1_001.fastq.gz`
+dname=`dirname $fq`
+sbatch scripts/fastqc.sbatch $fq ${dname}/${bname}L002_R2_001.fastq.gz ${dname}/${bname}L003_R1_001.fastq.gz ${dname}/${bname}L003_R2_001.fastq.gz
+
+fq=/pipeline/Runs/NovaSeq/230420_A01524_0115_AH7FGKDSX7/ProjectFolders/Project_Dane-Vassiliadis/Sample_5ND-2-Nascent/5ND-2-Nascent_S421_L002_R1_001.fastq.gz
+bname=`basename $fq L002_R1_001.fastq.gz`
+dname=`dirname $fq`
+sbatch scripts/fastqc.sbatch $fq ${dname}/${bname}L002_R2_001.fastq.gz ${dname}/${bname}L003_R1_001.fastq.gz ${dname}/${bname}L003_R2_001.fastq.gz
+
+# when fastqc is finished run multiqc 
+module load multiqc/1.8
+cd fastqc
+multiqc .
+cd ..
+```
+
+# run trimming, alignment, counting script
+```{bash}
+for fq in /pipeline/Runs/NovaSeq/230420_A01524_0115_AH7FGKDSX7/ProjectFolders/Project_Dane-Vassiliadis/Sample_[3-5]*/*L002_R1_001.fastq.gz
+do
+bname=`basename $fq L002_R1_001.fastq.gz`
+dname=`dirname $fq`
+sbatch scripts/align_star.sbatch $fq ${dname}/${bname}L002_R2_001.fastq.gz ${dname}/${bname}L003_R1_001.fastq.gz ${dname}/${bname}L003_R2_001.fastq.gz
+done
+
+for bw in /dawson_genomics/Projects/CB_ChIP/Nexus_paired/Nexus_output/*positive.bw
+do
+bname=`basename $bw positive.bw`
+dname=`dirname $bw`
+cat $bw ${dname}/${bname}negative.bw > ${dname}/cat_bw/${bname}pos_neg_merge.bw
+done
+
+# compile full multiqc
+module load multiqc/1.8
+multiqc .
+```
+
+# Load R libraries
+```{r}
+library(edgeR)
+library(data.table)
+library(RColorBrewer)
+library(EnhancedVolcano)
+library(enrichR)
+library(corrplot)
+library(dendextend)
+library(qvalue)
+library(GenomicFeatures)
+library(DEXSeq)
+library(Rsamtools)
+library(GenomicAlignments)
+library(ggplot2)
+library(viridis)
+library(dplyr)
+library(ggridges)
+library(Rsubread)
+library(ComplexHeatmap)
+library(ChIPseeker)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(circlize)
+library(ASpli)
+library(maser)
+```
+
+# set paths in R
+```{r}
+project.dir <- "/dawson_genomics/Projects/MYC/230420_TTseq"
+scratch.dir <- file.path("/scratch/teams", project.dir)
+counts.dir <- file.path(project.dir, "counts")
+res.dir <- file.path(project.dir, "results")
+plots.dir <- file.path(project.dir, "plots")
+dm.counts.dir <- file.path(project.dir, "Dm_counts")
+bed.dir <- file.path(project.dir, "bed_files")
+bam.dir <- file.path(project.dir, "bams")
+```
+
+
+# collate DM counts, use lib sizes to get scale factor for bigwigs
+```{r}
+dm.files <- list.files(dm.counts.dir)
+dm.counts = readDGE(
+  file = dm.files, 
+  path = dm.counts.dir
+  )
+
+# make text file with bam names and scale factors to use for deeptools
+# scale factor for each is 10000000/Dm reads
+bam.sf <- cbind(gsub("Dm.count", "sort.dedup.bam", dm.counts$samples$files), 10000000/dm.counts$samples$lib.size)
+write.table(
+  bam.sf,
+  file.path(dm.counts.dir, "bam_sf.txt"),
+  sep = ":",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# make bigwigs norm by coverage and spike-in
+```{bash}
+while read -r line
+do
+IFS=: read -r bam sf <<< $line
+sbatch scripts/DeeptoolsBamCov.sbatch bams/$bam $sf
+done < Dm_counts/bam_sf.txt
+```
+
+# DE of nascent RNA
+```{r}
+# get a list of all nascent files
+files <- list.files(counts.dir, pattern = "Nascent")
+
+# make sample annotation 
+sample.ann <- data.frame(
+  "files" = files, 
+  "samples" = gsub(".count", "", files), 
+  "tag" = c(rep("dTAG-V", 2), rep("dTAG-NEG", 2), rep("dTAG-V", 6), rep("dTAG-NEG", 6)),
+  "treatment" = c(rep(c("DMSO", "P300i"), 2), rep("DMSO", 3), rep("P3001", 3), rep("DMSO", 3), rep("P3001", 3)),
+  "replicate" = c(rep("3_1", 4), rep(c("5_1", "5_2", "5_3"), 4)),
+  "group" = c("dD", "dP", "ND", "NP", rep("dD", 3), rep("dP", 3), rep("ND", 3), rep("NP", 3))
+  )
+sample.ann
+
+dge.counts = readDGE(
+  file = sample.ann$files, 
+  path = counts.dir,
+  group = sample.ann$group
+  )
+```
+
+# Filtering out genes with low counts & not useful
+```{r}
+noint <- rownames(dge.counts$counts) %in% c("__no_feature", "__ambiguous", "__too_low_aQual","__not_aligned","__alignment_not_unique")
+counts.cpms <- cpm(dge.counts$counts)
+# start with minimal filter
+keep <- rowSums(counts.cpms > 1 ) >= 2 & !noint
+dim(dge.counts$counts)
+dge.counts$counts <- dge.counts$counts[keep,]
+dim(dge.counts$counts)
+```
+
+
+# add ann info
+```{r}
+dge.counts$samples$treatment = sample.ann$treatment
+dge.counts$samples$tag = sample.ann$tag
+dge.counts$samples$replicate = sample.ann$replicate
+```
+
+# MDS plot unnorm counts
+```{r}
+# Setting colours
+col.group <- as.factor(dge.counts$samples$group)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+col.group <- as.character(col.group)
+
+pdf(file.path(plots.dir, "MDS_nascent_unnorm_counts.pdf"))
+MDS = plotMDS(
+  dge.counts,
+  labels = paste0(dge.counts$samples$group, "_", dge.counts$samples$replicate), 
+  col = col.group,
+  main = "Nascent unnorm counts"
+  )
+dev.off()
+```
+
+# set spikein norm and write out file
+```{r}
+dge.counts$samples$norm.factors <- as.numeric(bam.sf[which(substr(bam.sf[, 1], 7, 13) == "Nascent"), 2])
+
+counts.norm <- dge.counts$counts%*%diag(dge.counts$samples$norm.factors)
+
+colnames(counts.norm) <- sample.ann$samples
+write.table(
+  counts.norm,
+  file.path(res.dir, "Nascent_spikeinnorm_counts.txt"),
+  sep = "\t",
+  col.names = NA,
+  row.names = TRUE,
+  quote = FALSE
+)
+```
+
+# MDS plot spikein norm counts
+```{r}
+pdf(file.path(plots.dir, "MDS_nascent_spikeinnorm_counts.pdf"))
+MDS = plotMDS(
+  dge.counts,
+  labels = paste0(dge.counts$samples$group, "_", dge.counts$samples$replicate), 
+  col = col.group,
+  main = "Nascent spike-in norm counts"
+  )
+dev.off()
+```
+
+# calc TMM norm and write out file
+```{r}
+dge.counts <- calcNormFactors(dge.counts, method="TMM")
+
+# multiply counts by norm factors
+counts.norm <- dge.counts$counts%*%diag(dge.counts$samples$norm.factors)
+colnames(counts.norm) <- sample.ann$samples
+write.table(
+  counts.norm,
+  file.path(res.dir, "Nascent_TMMnorm_counts.txt"),
+  sep = "\t",
+  col.names = NA,
+  row.names = TRUE,
+  quote = FALSE
+)
+```
+
+# MDS plot norm counts
+```{r}
+pdf(file.path(plots.dir, "MDS_nascent_TMMnorm_counts.pdf"))
+MDS = plotMDS(
+  dge.counts,
+  labels = paste0(dge.counts$samples$group, "_", dge.counts$samples$replicate), 
+  col = col.group,
+  main = "Nascent TMM norm counts"
+  )
+dev.off()
+```
+
+# TMM normalisation is clearly better, the spike-in normalisation is highly variable, proceeding with TMM
+# set design and contrasts for DE
+```{r}
+# design table
+design = model.matrix(~0+group, data = dge.counts$samples)
+colnames(design) <- gsub("group", "", colnames(design))
+design
+
+# just 1 comparison for now
+contr.matrix <- makeContrasts(
+  dPvNP = dP-NP,
+  levels = colnames(design)
+  )
+contr.matrix
+```
+
+# estimate dispersion and get DE
+```{r}
+dge.counts = estimateDisp(dge.counts, design)
+gfit <- glmQLFit(dge.counts, design)
+ftest <- glmQLFTest(gfit, contrast = contr.matrix)
+
+# annotate with gene symbols
+bm.ann <- fread("/data/reference/dawson_labs/biomart_annotations/Hsapiens/ensembl_hgnc_entrez.txt")
+ftest$table$ensg <- rownames(ftest$table)
+ftest$table <- merge(ftest$table, bm.ann, by.x = "ensg", by.y = "ensembl_gene_id")
+
+# order by pval
+ftest$table <- ftest$table[order(ftest$table$PValue, decreasing = FALSE),]
+
+# save results table
+write.table(
+  ftest$table,
+  file.path(res.dir, paste0(colnames(contr.matrix), "_ftest_table.txt")),
+  sep = "\t",
+  quote = FALSE,
+  col.names = NA,
+  row.names= TRUE
+)
+```
+
+# make MA plots
+```{r}
+pdf(file.path(plots.dir, paste0(colnames(contr.matrix), "_MAplot.pdf")))
+maPlot(
+  logAbundance = ftest$table$logCPM,
+  logFC = ftest$table$logFC,
+  main = colnames(contr.matrix),
+  xlab = expression(bold(paste("log"[2], " CPM"))),
+  ylab = expression(bold(paste("log"[2], " FC"))),
+  col = "black",
+  allCol ="red",
+  lowess = T
+)
+dev.off()
+```
+
+# make volcano plot
+```{r}
+pdf(file.path(plots.dir, paste0(colnames(contr.matrix), "_volcano_plot.pdf")))
+EnhancedVolcano(
+  ftest$table,
+  title = colnames(contr.matrix),
+  labSize = 2,
+  lab = ftest$table$hgnc_symbol,
+  x = "logFC",
+  y = "PValue",
+  drawConnectors = TRUE,
+  widthConnectors = 0.5
+  )
+dev.off()
+```
+
+# look at GSEA for genes p<10e-6
+```{r}
+dbs <- c("GO_Molecular_Function_2021", "GO_Cellular_Component_2021", "GO_Biological_Process_2021", "MSigDB_Hallmark_2020", "KEGG_2021_Human", "NCI-Nature_2015", "WikiPathway_2021_Human", "RNAseq_Automatic_GEO_Signatures_Human_Up", "RNAseq_Automatic_GEO_Signatures_Human_Down")
+
+# limit to sig.up genes
+sig.genes <- ftest$table$hgnc_symbol[which(ftest$table$PValue < 10e-6 & ftest$table$logFC > 0)]
+sig.enrich <- enrichr(sig.genes, dbs)
+pdf(file.path(plots.dir, "siggenes_enrichR_plots.pdf"), height = 8, width = 10)
+plotEnrich(sig.enrich[[1]], numChar = 65, title = names(sig.enrich)[[1]])
+plotEnrich(sig.enrich[[2]], numChar = 65, title = names(sig.enrich)[[2]])
+plotEnrich(sig.enrich[[3]], numChar = 65, title = names(sig.enrich)[[3]])
+plotEnrich(sig.enrich[[4]], numChar = 65, title = names(sig.enrich)[[4]])
+plotEnrich(sig.enrich[[5]], numChar = 65, title = names(sig.enrich)[[5]])
+plotEnrich(sig.enrich[[6]], numChar = 65, title = names(sig.enrich)[[6]])
+plotEnrich(sig.enrich[[7]], numChar = 65, title = names(sig.enrich)[[7]])
+plotEnrich(sig.enrich[[8]], numChar = 65, title = names(sig.enrich)[[8]])
+plotEnrich(sig.enrich[[9]], numChar = 65, title = names(sig.enrich)[[9]])
+dev.off()
+```
+
+# look at total RNA for replicate concordance
+```{r}
+# get a list of all nascent files
+tot.files <- list.files(counts.dir, pattern = "Total")
+
+# make sample annotation 
+tot.ann <- data.frame(
+  "files" = tot.files, 
+  "samples" = gsub(".count", "", tot.files), 
+  "tag" = c(rep("dTAG-V", 2), rep("dTAG-NEG", 2), rep("dTAG-V", 6), rep("dTAG-NEG", 6)),
+  "treatment" = c(rep(c("DMSO", "P300i"), 2), rep("DMSO", 3), rep("P3001", 3), rep("DMSO", 3), rep("P3001", 3)),
+  "replicate" = c(rep("3_1", 4), rep(c("5_1", "5_2", "5_3"), 4)),
+  "group" = c("dD", "dP", "ND", "NP", rep("dD", 3), rep("dP", 3), rep("ND", 3), rep("NP", 3))
+  )
+tot.ann
+
+tot.counts = readDGE(
+  file = tot.ann$files, 
+  path = counts.dir,
+  group = tot.ann$group
+  )
+```
+
+# Filtering out genes with low counts
+```{r}
+noint <- rownames(tot.counts$counts) %in% c("__no_feature", "__ambiguous", "__too_low_aQual","__not_aligned","__alignment_not_unique")
+tot.cpms <- cpm(tot.counts$counts)
+# start with minimal filter
+keep <- rowSums(tot.cpms > 1 ) >= 2 & !noint
+dim(tot.counts$counts)
+tot.counts$counts <- tot.counts$counts[keep,]
+dim(tot.counts$counts)
+```
+
+# MDS plot unnorm counts
+```{r}
+tot.counts$samples$replicate = tot.ann$replicate
+# Setting colours
+col.group <- as.factor(tot.counts$samples$group)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+col.group <- as.character(col.group)
+
+pdf(file.path(plots.dir, "MDS_total_unnorm_counts.pdf"))
+MDS = plotMDS(
+  tot.counts,
+  labels = paste0(tot.counts$samples$group, "_", tot.counts$samples$replicate), 
+  col = col.group,
+  main = "Total unnorm counts"
+  )
+dev.off()
+```
+
+# calc TMM norm and write out file
+```{r}
+tot.counts <- calcNormFactors(tot.counts, method="TMM")
+
+# multiply counts by norm factors
+tot.counts.norm <- tot.counts$counts%*%diag(tot.counts$samples$norm.factors)
+colnames(tot.counts.norm) <- tot.ann$samples
+write.table(
+  tot.counts.norm,
+  file.path(res.dir, "Total_TMMnorm_counts.txt"),
+  sep = "\t",
+  col.names = NA,
+  row.names = TRUE,
+  quote = FALSE
+)
+```
+
+# MDS plot norm counts
+```{r}
+pdf(file.path(plots.dir, "MDS_total_TMMnorm_counts.pdf"))
+MDS = plotMDS(
+  tot.counts,
+  labels = paste0(tot.counts$samples$group, "_", tot.counts$samples$replicate), 
+  col = col.group,
+  main = "Total TMM norm counts"
+  )
+dev.off()
+```
+
+# also look at correlation plot of total RNAseq (TMM)
+```{r}
+cor.data <- cor(tot.counts.norm)
+pdf(file.path(plots.dir, "Corrplot_total_TMMnorm_counts.pdf"))
+corrplot.mixed(
+  cor.data, 
+  lower = "number",
+  upper = "circle",
+  order = "hclust", 
+  tl.col = "black", 
+  tl.cex = 0.5, 
+  upper.col = brewer.pal(n = 11, name = "RdYlBu"), 
+  number.cex = 0.7, 
+  tl.pos = "lt", 
+  diag = "l"
+  )
+dev.off()
+```
+
+# look at dendrogram of hclust
+```{r}
+set.seed(333)
+
+tot.dist <- dist(t(tot.counts.norm))
+tot.hc <- hclust(tot.dist)
+
+# make annotation of replicates and groups 
+rep.col.group <- as.factor(tot.counts$samples$replicate)
+levels(rep.col.group) <- brewer.pal(nlevels(rep.col.group), "Set1") 
+rep.col.group <- as.character(rep.col.group)
+group.col.group <- as.factor(tot.counts$samples$group)
+levels(group.col.group) <- brewer.pal(nlevels(group.col.group), "Dark2") 
+group.col.group <- as.character(group.col.group)
+# order by dendrogram
+col_bars <- cbind(rep.col.group[tot.hc$order], group.col.group[tot.hc$order])
+colnames(col_bars) <- c("replicate", "group")
+
+pdf(file.path(plots.dir, "Dendrogram_totalRNA_TMMnorm_counts.pdf"))
+plot(tot.hc, hang = -1, cex = 0.8)
+colored_bars(colors = col_bars)
+dev.off()
+```
+
+# clustering isn't great, particularly in dTAGged samples, but will try without poor rep to see how it looks
+
+# in MDS clone 3 is further from others, but based on correlation and clustering clone 5 rep 1 seems the most poorly concordant 
+# however when clone 5 rep 1 is removed, clone 3 is still an outlier and hclust is not much improved (altough all have really strong correlation)
+# try again without clone 3 
+```{r}
+# remove clone 3
+rep3_1 <- which(tot.ann$replicate == "3_1")
+
+tot.counts = readDGE(
+  file = tot.ann$files[-rep3_1], 
+  path = counts.dir,
+  group = tot.ann$group[-rep3_1]
+  )
+```
+
+# Filtering 
+```{r}
+noint <- rownames(tot.counts$counts) %in% c("__no_feature", "__ambiguous", "__too_low_aQual","__not_aligned","__alignment_not_unique")
+tot.cpms <- cpm(tot.counts$counts)
+# start with minimal filter
+keep <- rowSums(tot.cpms > 1 ) >= 2 & !noint
+dim(tot.counts$counts)
+tot.counts$counts <- tot.counts$counts[keep,]
+dim(tot.counts$counts)
+```
+
+# redo plots without rep 3_1
+```{r}
+tot.ann <- tot.ann[-rep3_1,]
+tot.counts$samples$replicate = tot.ann$replicate
+# Setting colours
+col.group <- as.factor(tot.counts$samples$group)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+col.group <- as.character(col.group)
+
+pdf(file.path(plots.dir, "MDS_total3rep_unnorm_counts.pdf"))
+MDS = plotMDS(
+  tot.counts,
+  labels = paste0(tot.counts$samples$group, "_", tot.counts$samples$replicate), 
+  col = col.group,
+  main = "Total unnorm counts"
+  )
+dev.off()
+```
+
+# calc TMM norm and write out file
+```{r}
+tot.counts <- calcNormFactors(tot.counts, method="TMM")
+
+# multiply counts by norm factors
+tot.counts.norm <- tot.counts$counts%*%diag(tot.counts$samples$norm.factors)
+colnames(tot.counts.norm) <- tot.ann$samples
+write.table(
+  tot.counts.norm,
+  file.path(res.dir, "Total3rep_TMMnorm_counts.txt"),
+  sep = "\t",
+  col.names = NA,
+  row.names = TRUE,
+  quote = FALSE
+)
+```
+
+# MDS plot norm counts
+```{r}
+pdf(file.path(plots.dir, "MDS_total3rep_TMMnorm_counts.pdf"))
+MDS = plotMDS(
+  tot.counts,
+  labels = paste0(tot.counts$samples$group, "_", tot.counts$samples$replicate), 
+  col = col.group,
+  main = "Total TMM norm counts"
+  )
+dev.off()
+```
+
+# corr plot
+```{r}
+cor.data <- cor(tot.counts.norm)
+pdf(file.path(plots.dir, "Corrplot_total3rep_TMMnorm_counts.pdf"))
+corrplot.mixed(
+  cor.data, 
+  lower = "number",
+  upper = "circle",
+  order = "hclust", 
+  tl.col = "black", 
+  tl.cex = 0.5, 
+  upper.col = brewer.pal(n = 11, name = "RdYlBu"), 
+  number.cex = 0.7, 
+  tl.pos = "lt", 
+  diag = "l"
+  )
+dev.off()
+```
+
+# look at dendrogram of hclust
+```{r}
+tot.dist <- dist(t(tot.counts.norm))
+tot.hc <- hclust(tot.dist)
+
+# make annotation of replicates and groups 
+rep.col.group <- as.factor(tot.counts$samples$replicate)
+levels(rep.col.group) <- brewer.pal(nlevels(rep.col.group), "Set1") 
+rep.col.group <- as.character(rep.col.group)
+group.col.group <- as.factor(tot.counts$samples$group)
+levels(group.col.group) <- brewer.pal(nlevels(group.col.group), "Dark2") 
+group.col.group <- as.character(group.col.group)
+# order by dendrogram
+col_bars <- cbind(rep.col.group[tot.hc$order], group.col.group[tot.hc$order])
+colnames(col_bars) <- c("replicate", "group")
+
+pdf(file.path(plots.dir, "Dendrogram_totalRNA3rep_TMMnorm_counts.pdf"))
+plot(tot.hc, hang = -1, cex = 0.8)
+colored_bars(colors = col_bars)
+dev.off()
+```
+
+# mds looks really nice with clone 3 removed, 5_1 still doesn't correlate well with other replictes but we can continue with all 3 clone 5 reps for now
+# back to nascent DE analysis removing clone 3
+```{r}
+# remove rep 5_1
+rep3_1 <- which(sample.ann$replicate == "3_1")
+
+dge.counts = readDGE(
+  file = sample.ann$files[-rep3_1], 
+  path = counts.dir,
+  group = sample.ann$group[-rep3_1]
+  )
+```
+
+# Filtering out genes with low counts & not useful
+```{r}
+noint <- rownames(dge.counts$counts) %in% c("__no_feature", "__ambiguous", "__too_low_aQual","__not_aligned","__alignment_not_unique")
+counts.cpms <- cpm(dge.counts$counts)
+# start with minimal filter
+keep <- rowSums(counts.cpms > 1 ) >= 2 & !noint
+dim(dge.counts$counts)
+dge.counts$counts <- dge.counts$counts[keep,]
+dim(dge.counts$counts)
+```
+
+
+# add ann info
+```{r}
+sample.ann <- sample.ann[-rep3_1,]
+dge.counts$samples$treatment = sample.ann$treatment
+dge.counts$samples$tag = sample.ann$tag
+dge.counts$samples$replicate = sample.ann$replicate
+```
+
+# MDS plot unnorm counts
+```{r}
+# Setting colours
+col.group <- as.factor(dge.counts$samples$group)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+col.group <- as.character(col.group)
+
+pdf(file.path(plots.dir, "MDS_nascent3rep_unnorm_counts.pdf"))
+MDS = plotMDS(
+  dge.counts,
+  labels = paste0(dge.counts$samples$group, "_", dge.counts$samples$replicate), 
+  col = col.group,
+  main = "Nascent unnorm counts"
+  )
+dev.off()
+```
+
+# calc TMM norm and write out file
+```{r}
+dge.counts <- calcNormFactors(dge.counts, method="TMM")
+
+# multiply counts by norm factors
+counts.norm <- dge.counts$counts%*%diag(dge.counts$samples$norm.factors)
+colnames(counts.norm) <- sample.ann$samples
+write.table(
+  counts.norm,
+  file.path(res.dir, "Nascent_TMMnorm3rep_counts.txt"),
+  sep = "\t",
+  col.names = NA,
+  row.names = TRUE,
+  quote = FALSE
+)
+```
+
+# MDS plot norm counts
+```{r}
+pdf(file.path(plots.dir, "MDS_nascent3rep_TMMnorm_counts.pdf"))
+MDS = plotMDS(
+  dge.counts,
+  labels = paste0(dge.counts$samples$group, "_", dge.counts$samples$replicate), 
+  col = col.group,
+  main = "Nascent TMM norm counts"
+  )
+dev.off()
+```
+
+
+# set design and contrasts for DE
+```{r}
+# design table
+design = model.matrix(~0+group, data = dge.counts$samples)
+colnames(design) <- gsub("group", "", colnames(design))
+design
+
+# just 1 comparison for now
+contr.matrix <- makeContrasts(
+  dPvNP = dP-NP,
+  levels = colnames(design)
+  )
+contr.matrix
+```
+
+# estimate dispersion and get DE
+```{r}
+dge.counts = estimateDisp(dge.counts, design)
+gfit <- glmQLFit(dge.counts, design)
+ftest <- glmQLFTest(gfit, contrast = contr.matrix)
+
+# annotate with gene symbols
+ftest$table$ensg <- rownames(ftest$table)
+ftest$table <- merge(ftest$table, bm.ann, by.x = "ensg", by.y = "ensembl_gene_id")
+
+# order by pval
+ftest$table <- ftest$table[order(ftest$table$PValue, decreasing = FALSE),]
+
+# save results table
+write.table(
+  ftest$table,
+  file.path(res.dir, paste0("Nascent3rep_", colnames(contr.matrix), "_ftest_table.txt")),
+  sep = "\t",
+  quote = FALSE,
+  col.names = NA,
+  row.names= TRUE
+)
+```
+
+# make MA plots
+```{r}
+pdf(file.path(plots.dir, paste0("MAplot_Nascent3rep_", colnames(contr.matrix), ".pdf")))
+maPlot(
+  logAbundance = ftest$table$logCPM,
+  logFC = ftest$table$logFC,
+  main = colnames(contr.matrix),
+  xlab = expression(bold(paste("log"[2], " CPM"))),
+  ylab = expression(bold(paste("log"[2], " FC"))),
+  col = "black",
+  allCol ="red",
+  lowess = T
+)
+dev.off()
+```
+
+# make volcano plot
+```{r}
+pdf(file.path(plots.dir, paste0("Volcano_Nascent3rep_", colnames(contr.matrix), ".pdf")))
+EnhancedVolcano(
+  ftest$table,
+  title = colnames(contr.matrix),
+  labSize = 2,
+  lab = ftest$table$hgnc_symbol,
+  x = "logFC",
+  y = "PValue",
+  drawConnectors = TRUE,
+  widthConnectors = 0.5
+  )
+dev.off()
+```
+
+
+# look at GSEA for genes p<10e-6
+```{r}
+dbs <- c("GO_Molecular_Function_2021", "GO_Cellular_Component_2021", "GO_Biological_Process_2021", "MSigDB_Hallmark_2020", "KEGG_2021_Human", "NCI-Nature_2015", "WikiPathway_2021_Human", "RNAseq_Automatic_GEO_Signatures_Human_Up", "RNAseq_Automatic_GEO_Signatures_Human_Down")
+
+# limit to most sig genes in each cluster to limit confounding
+sig.up <- ftest$table$hgnc_symbol[which(ftest$table$PValue < 10e-6 & ftest$table$logFC > 0)]
+sig.enrich <- enrichr(sig.up, dbs)
+pdf(file.path(plots.dir, "enrichRplots_Nascent3rep_siggenes.pdf"), height = 8, width = 10)
+plotEnrich(sig.enrich[[1]], numChar = 65, title = names(sig.enrich)[[1]])
+plotEnrich(sig.enrich[[2]], numChar = 65, title = names(sig.enrich)[[2]])
+plotEnrich(sig.enrich[[3]], numChar = 65, title = names(sig.enrich)[[3]])
+plotEnrich(sig.enrich[[4]], numChar = 65, title = names(sig.enrich)[[4]])
+plotEnrich(sig.enrich[[5]], numChar = 65, title = names(sig.enrich)[[5]])
+plotEnrich(sig.enrich[[6]], numChar = 65, title = names(sig.enrich)[[6]])
+plotEnrich(sig.enrich[[7]], numChar = 65, title = names(sig.enrich)[[7]])
+plotEnrich(sig.enrich[[8]], numChar = 65, title = names(sig.enrich)[[8]])
+plotEnrich(sig.enrich[[9]], numChar = 65, title = names(sig.enrich)[[9]])
+dev.off()
+```
+
+# examine norm counts per sample to see if overall trend goes up and each individual sample, for MYC, overall and sig only
+```{r}
+# get norm counts with all 4 replicates
+all.counts.norm <- read.table(file.path(res.dir, "Nascent_TMMnorm_counts.txt"), row.names = 1)
+
+line.data <- data.frame(
+  replicate = c(rep("3_1", 4), rep(c("5_1", "5_2", "5_3"), 4)),
+  dTAG = c("DMSO_dTAG-V", "P300i_dTAG-V", "DMSO_dTAG-NEG", "P300i_dTAG-NEG", rep("DMSO_dTAG-V", 3), rep("P300i_dTAG-V", 3), rep("DMSO_dTAG-NEG", 3), rep("P300i_dTAG-NEG", 3)),
+  counts = t(all.counts.norm["ENSG00000136997", ])
+)
+colnames(line.data)[3] <- "TMMcounts"
+
+pdf(file.path(plots.dir, "lineplot_all_sample_TMMcounts_MYC.pdf"))
+ggplot(line.data, aes(x = dTAG, y = TMMcounts, group = replicate)) +
+  geom_line(aes(color = replicate)) +
+  geom_point(aes(color = replicate)) + 
+  scale_color_brewer(palette = "Dark2") + 
+  theme_classic() +
+  labs(title = "MYC nascent TMM counts")
+dev.off()
+
+# all genes, total counts
+line.data$TMMcounts <- colSums(all.counts.norm)
+
+pdf(file.path(plots.dir, "lineplot_all_sample_TMMcounts_allGenes.pdf"))
+ggplot(line.data, aes(x = dTAG, y = TMMcounts, group = replicate)) +
+  geom_line(aes(color = replicate)) +
+  geom_point(aes(color = replicate)) + 
+  scale_color_brewer(palette = "Dark2") + 
+  theme_classic() +
+  labs(title = "All genes nascent TMM counts")
+dev.off()
+
+# sig up in dPvNP only
+sig.up <- ftest$table$ensg[which(ftest$table$PValue < 10e-6 & ftest$table$logFC > 0)]
+line.data$TMMcounts <- colSums(all.counts.norm[sig.up, ])
+
+pdf(file.path(plots.dir, "lineplot_all_sample_TMMcounts_sigUpGenes.pdf"))
+ggplot(line.data, aes(x = dTAG, y = TMMcounts, group = replicate)) +
+  geom_line(aes(color = replicate)) +
+  geom_point(aes(color = replicate)) + 
+  scale_color_brewer(palette = "Dark2") + 
+  theme_classic() +
+  labs(title = "Significantly upregulated genes nascent TMM counts")
+dev.off()
+```
+
+# look into DEU on total RNAseq data
+# make files for DEXseq
+```{bash}
+module load htseq/0.11.2
+cd /data/reference/dawson_labs/genomes/Hg38/
+
+# make collapsed annotation as required by DEXseq
+python /config/binaries/R/4.2.0/R_libraries/DEXSeq/python_scripts/dexseq_prepare_annotation.py Homo_sapiens.GRCh38.102.gtf Homo_sapiens.GRCh38.102.DEXSeq.gff
+
+# get dexseq style counts using annotation above
+#cd /dawson_genomics/Projects/MYC/230420_TTseq
+#for bam in bams/*Total*.sort.dedup.bam
+#do
+#sbatch scripts/dexseq_counts.sbatch $bam
+#done
+```
+
+# counts reads with DEXseq ann and read in DEXSeq object
+```{r}
+# make DEXseq style annotation
+txdb = makeTxDbFromGFF("/data/reference/dawson_labs/genomes/Hg38/Homo_sapiens.GRCh38.102.gtf")
+flat.ann = exonicParts(txdb, linked.to.single.gene.only = TRUE)
+names(flat.ann) = sprintf("%s:E%0.3d", flat.ann$gene_id, flat.ann$exonic_part)
+
+nac.bams <- list.files(file.path(project.dir, "bams"), pattern = "Nascent_S[0-9][0-9][0-9].sort.dedup.bam$", full.names = TRUE)
+nac.bam.files <- BamFileList(nac.bams)
+se = summarizeOverlaps(flat.ann, BamFileList(nac.bams), singleEnd = FALSE, fragments = TRUE)
+colData(se)$condition <- factor(substr(colnames(se), 2, 3))
+dxd = DEXSeqDataSetFromSE(se, design= ~ sample + exon + condition:exon)
+colData(dxd)$sample <- factor(gsub("-", "_", gsub(".sort.dedup.bam", "", colData(dxd)$sample)))
+
+# normalise and est dispersion
+dxd <- estimateSizeFactors(dxd)
+dxd <- estimateDispersions(dxd)
+pdf(file.path(plots.dir, "DEU_dispersion_plot.pdf"))
+plotDispEsts(dxd)
+dev.off()
+
+# perform DEU and get results table
+dxd <- testForDEU(dxd)
+res.dxd <- DEXSeqResults(dxd)
+
+# plot EP300 
+pdf(file.path(plots.dir, "DEUplot_EP300_isoforms.pdf"), width = 12, height = 12)
+plotDEXSeq(res.dxd, "ENSG00000100393", legend = TRUE, lwd = 2, displayTranscripts = TRUE, names = TRUE)
+dev.off()
+pdf(file.path(plots.dir, "DEUplot_EP300_splicing.pdf"), width = 12, height = 12)
+plotDEXSeq(res.dxd, "ENSG00000100393", legend = TRUE, lwd = 2, splicing = TRUE, names = TRUE)
+dev.off()
+pdf(file.path(plots.dir, "DEUplot_EP300_repCounts.pdf"), width = 8, height = 12)
+plotDEXSeq(res.dxd, "ENSG00000100393", legend = TRUE, lwd = 2, norCounts = TRUE)
+dev.off()
+
+# plot MYC 
+pdf(file.path(plots.dir, "DEUplot_MYC_isoforms.pdf"), width = 12, height = 12)
+plotDEXSeq(res.dxd, "ENSG00000136997", legend = TRUE, lwd = 2, displayTranscripts = TRUE, names = TRUE)
+dev.off()
+pdf(file.path(plots.dir, "DEUplot_MYC_splicing.pdf"), width = 12, height = 12)
+plotDEXSeq(res.dxd, "ENSG00000136997", legend = TRUE, lwd = 2, splicing = TRUE, names = TRUE)
+dev.off()
+pdf(file.path(plots.dir, "DEUplot_MYC_repCounts.pdf"), width = 8, height = 12)
+plotDEXSeq(res.dxd, "ENSG00000136997", legend = TRUE, lwd = 2, norCounts = TRUE)
+dev.off()
+
+# get results table for EP300
+res.dxd[which(res.dxd$groupID == "ENSG00000100393"), ]
+ex36.counts <- res.dxd["ENSG00000100393:E036",]$countData %*% diag(colData(dxd)$sizeFactor[1:16])
+# get sig results table for MYC 
+res.dxd[which(res.dxd$groupID == "ENSG00000136997" & res.dxd$padj < 0.05), ]
+# and sig exon
+myc.ex24.counts <- res.dxd["ENSG00000136997:E024",]$countData %*% diag(colData(dxd)$sizeFactor[1:16])
+colnames(myc.ex24.counts) <- colData(dxd)$sample[1:16]
+
+# how may genes have DEU
+table(tapply(res.dxd$padj < 0.05, res.dxd$groupID, any))
+``` 
+FALSE  TRUE 
+ 2515  9533 
+
+# process and analyse lanes separately
+```{bash}
+# this analysis will be contained in a separate directory which mirrors previous analysis and can be deleted if nothing found
+cd lane_analysis
+
+for fq in /pipeline/Runs/NovaSeq/230420_A01524_0115_AH7FGKDSX7/ProjectFolders/Project_Dane-Vassiliadis/Sample_[3-5]*/*_R1_001.fastq.gz
+do
+bname=`basename $fq _R1_001.fastq.gz`
+dname=`dirname $fq`
+sbatch scripts/align_star.sbatch $fq ${dname}/${bname}_R2_001.fastq.gz 
+done
+```
+
+# check out DE on these counts
+# DE of nascent RNA
+```{r}
+lane.dir <- file.path(project.dir, "lane_analysis")
+# get a list of all nascent files
+files <- list.files(file.path(lane.dir, "counts"), pattern = "Nascent")
+
+# remake sample annotation of all samples and add lane column for batch correction
+lane.sample.ann <- data.frame(
+  "files" = files, 
+  "samples" = gsub(".count", "", files), 
+  "tag" = c(rep("dTAG-V", 4), rep("dTAG-NEG", 4), rep("dTAG-V", 12), rep("dTAG-NEG", 12)),
+  "treatment" = c(rep(c("DMSO", "DMSO", "P300i", "P300i"), 2), rep("DMSO", 6), rep("P3001", 6), rep("DMSO", 6), rep("P3001", 6)),
+  "replicate" = c(rep("3_1", 8), rep(c("5_1", "5_1", "5_2", "5_2", "5_3", "5_3"), 4)),
+  "group" = c("dD", "dD", "dP", "dP", "ND","ND", "NP", "NP", rep("dD", 6), rep("dP", 6), rep("ND", 6), rep("NP", 6)),
+  "lane" = rep(c(2, 3), 16)
+  )
+lane.sample.ann
+
+dge.counts = readDGE(
+  file = lane.sample.ann$files, 
+  path = file.path(lane.dir, "counts"),
+  group = lane.sample.ann$group
+  )
+```
+
+# Filtering out genes with low counts & not useful
+```{r}
+noint <- rownames(dge.counts$counts) %in% c("__no_feature", "__ambiguous", "__too_low_aQual","__not_aligned","__alignment_not_unique")
+counts.cpms <- cpm(dge.counts$counts)
+# start with minimal filter
+keep <- rowSums(counts.cpms > 1 ) >= 4 & !noint
+dim(dge.counts$counts)
+dge.counts$counts <- dge.counts$counts[keep,]
+dim(dge.counts$counts)
+```
+
+# add ann info
+```{r}
+dge.counts$samples$treatment = lane.sample.ann$treatment
+dge.counts$samples$tag = lane.sample.ann$tag
+dge.counts$samples$replicate = lane.sample.ann$replicate
+dge.counts$samples$lane = lane.sample.ann$lane
+```
+
+# MDS plot unnorm counts, color by lane
+```{r}
+# Setting colours
+col.group <- as.factor(dge.counts$samples$lane)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+col.group <- as.character(col.group)
+
+pdf(file.path(lane.dir, "plots/MDS_nascent_unnorm_counts_laneColored.pdf"))
+MDS = plotMDS(
+  dge.counts,
+  labels = paste0(dge.counts$samples$group, "_", dge.counts$samples$replicate), 
+  col = col.group,
+  main = "Nascent unnorm counts"
+  )
+dev.off()
+```
+
+# calc TMM norm and make MDS
+```{r}
+dge.counts <- calcNormFactors(dge.counts, method="TMM")
+
+# multiply counts by norm factors
+counts.norm <- dge.counts$counts%*%diag(dge.counts$samples$norm.factors)
+colnames(counts.norm) <- colnames(dge.counts$counts)
+
+pdf(file.path(lane.dir, "plots/MDS_nascent_TMMnorm_counts_laneColored.pdf"))
+MDS = plotMDS(
+  dge.counts,
+  labels = paste0(dge.counts$samples$group, "_", dge.counts$samples$replicate), 
+  col = col.group,
+  main = "Nascent TMM norm counts"
+  )
+dev.off()
+```
+
+##### no substantial difference seen between lanes so this is unlikely to change DE results, removing this bit of analysis (except for plots) to conserve space, but can be repeated with code above if it is needed #####
+
+
+# perform DE analysis with all reps included, as they all have different trends the variation in all should be considered
+```{r}
+# get all nascent 
+files <- list.files(counts.dir, pattern = "Nascent")
+
+# remake sample annotation with all
+sample.ann <- data.frame(
+  "files" = files, 
+  "samples" = gsub(".count", "", files), 
+  "tag" = c(rep("dTAG-V", 2), rep("dTAG-NEG", 2), rep("dTAG-V", 6), rep("dTAG-NEG", 6)),
+  "treatment" = c(rep(c("DMSO", "P300i"), 2), rep("DMSO", 3), rep("P3001", 3), rep("DMSO", 3), rep("P3001", 3)),
+  "replicate" = c(rep("3_1", 4), rep(c("5_1", "5_2", "5_3"), 4)),
+  "group" = c("dD", "dP", "ND", "NP", rep("dD", 3), rep("dP", 3), rep("ND", 3), rep("NP", 3))
+  )
+sample.ann
+
+dge.counts = readDGE(
+  file = sample.ann$files, 
+  path = counts.dir,
+  group = sample.ann$group
+  )
+```
+
+# Filtering out genes with low counts & not useful
+```{r}
+noint <- rownames(dge.counts$counts) %in% c("__no_feature", "__ambiguous", "__too_low_aQual","__not_aligned","__alignment_not_unique")
+counts.cpms <- cpm(dge.counts$counts)
+# start with minimal filter
+keep <- rowSums(counts.cpms > 1 ) >= 2 & !noint
+dim(dge.counts$counts)
+dge.counts$counts <- dge.counts$counts[keep,]
+dim(dge.counts$counts)
+```
+
+# calc TMM norm and write out file
+```{r}
+dge.counts <- calcNormFactors(dge.counts, method="TMM")
+
+# multiply counts by norm factors
+counts.norm <- dge.counts$counts%*%diag(dge.counts$samples$norm.factors)
+colnames(counts.norm) <- colnames(dge.counts$counts)
+```
+
+# set design and contrasts for DE, include additional comparisons
+```{r}
+# design table
+design = model.matrix(~0+group, data = dge.counts$samples)
+colnames(design) <- gsub("group", "", colnames(design))
+design
+
+# just 1 comparison for now
+contr.matrix <- makeContrasts(
+  dPvNP = dP-NP,
+  dDvND = dD-ND,
+  NPvND = NP-ND,
+  levels = colnames(design)
+  )
+contr.matrix
+```
+
+# estimate dispersion and get DE
+```{r}
+dge.counts = estimateDisp(dge.counts, design)
+gfit <- glmQLFit(dge.counts, design)
+
+ftest.list <- list()
+
+for(contrast.i in 1:length(colnames(contr.matrix))){
+
+  ftest.list[[contrast.i]] <- glmQLFTest(gfit, contrast = contr.matrix[, contrast.i])
+  ftest.list[[contrast.i]]$table$ensg <- rownames(ftest.list[[contrast.i]]$table)
+  ftest.list[[contrast.i]]$table <- merge(ftest.list[[contrast.i]]$table, bm.ann, by.x = "ensg", by.y = "ensembl_gene_id")
+  # add qvalues to table, order by that and write out
+  qv <- qvalue(ftest.list[[contrast.i]]$table$PValue)
+  ftest.list[[contrast.i]]$table$QValue <- qv$qvalues
+  ftest.list[[contrast.i]]$table <- ftest.list[[contrast.i]]$table[order(ftest.list[[contrast.i]]$table$QValue, decreasing = FALSE),]
+  write.table(
+    ftest.list[[contrast.i]]$table,
+    file.path(res.dir, paste0(colnames(contr.matrix)[contrast.i], "_ftest_table.txt")),
+    sep = "\t",
+    quote = F,
+    col.names = T,
+    row.names= F
+  )
+}
+names(ftest.list) <- colnames(contr.matrix)
+```
+
+# overlap sig genes from all comparisons to find those unique to dPvNP
+```{r}
+# get sig up genes in each comparison
+dpnp.up <- ftest.list$dPvNP$table$hgnc_symbol[which(ftest.list$dPvNP$table$QValue < 0.05 & ftest.list$dPvNP$table$logFC > 0)]
+ddnd.up <- ftest.list$dDvND$table$hgnc_symbol[which(ftest.list$dDvND$table$QValue < 0.05 & ftest.list$dDvND$table$logFC > 0)]
+npnd.up <- ftest.list$NPvND$table$hgnc_symbol[which(ftest.list$NPvND$table$QValue < 0.05 & ftest.list$NPvND$table$logFC > 0)]
+
+dpnp.only <- dpnp.up[-which(dpnp.up %in% c(ddnd.up, npnd.up))]
+```
+
+# look at GSEA for above gene list
+```{r}
+dbs <- c("GO_Molecular_Function_2021", "GO_Cellular_Component_2021", "GO_Biological_Process_2021", "MSigDB_Hallmark_2020", "KEGG_2021_Human", "NCI-Nature_2015", "WikiPathway_2021_Human", "RNAseq_Automatic_GEO_Signatures_Human_Up", "RNAseq_Automatic_GEO_Signatures_Human_Down")
+
+# limit to dPvNP only genes
+dpnp.enrich <- enrichr(dpnp.only, dbs)
+pdf(file.path(plots.dir, "dPvNPonly_enrichR_plots.pdf"), height = 8, width = 10)
+plotEnrich(dpnp.enrich[[1]], numChar = 65, title = names(dpnp.enrich)[[1]])
+plotEnrich(dpnp.enrich[[2]], numChar = 65, title = names(dpnp.enrich)[[2]])
+plotEnrich(dpnp.enrich[[3]], numChar = 65, title = names(dpnp.enrich)[[3]])
+plotEnrich(dpnp.enrich[[4]], numChar = 65, title = names(dpnp.enrich)[[4]])
+plotEnrich(dpnp.enrich[[5]], numChar = 65, title = names(dpnp.enrich)[[5]])
+plotEnrich(dpnp.enrich[[6]], numChar = 65, title = names(dpnp.enrich)[[6]])
+plotEnrich(dpnp.enrich[[7]], numChar = 65, title = names(dpnp.enrich)[[7]])
+plotEnrich(dpnp.enrich[[8]], numChar = 65, title = names(dpnp.enrich)[[8]])
+plotEnrich(dpnp.enrich[[9]], numChar = 65, title = names(dpnp.enrich)[[9]])
+dev.off()
+```
+
+# save dPvNP genes as bed file to use with deeptools in proseq data
+```{r}
+# read in DT friendly bed file and limit to dpnp genes
+dt.bed <- fread("/data/reference/dawson_labs/bed_files/Hg38/Hg38EnsGeneStrandPlusMinusWhitelist.bed")
+dpnp.bed <- dt.bed[which(dt.bed$V4 %in% dpnp.only), ]
+write.table(
+  dpnp.bed,
+  file.path(bed.dir, "dPvNPonly_up_genes.bed"),
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# get some stats on dPvNP only genes
+```{r}
+# how many on each chr
+table(dpnp.bed$V1)
+ 1 10 11 12 13 14 15 16 17 18 19  2 20 21 22  3  4  5  6  7  8  9  X 
+72 28 47 33 10 12 20 50 49  4 63 50 24 15 25 38 17 20 36 41 21 40 23 
+
+# make a density plot of gene lengths
+dpnp.length <- as.data.frame(dpnp.bed$V3 - dpnp.bed$V2)
+colnames(dpnp.length) <- "length"
+dens.data <- dpnp.length %>%
+  filter(length < 100000)
+pdf(file.path(plots.dir, "density_dPvNPonly_genes_length.pdf"))
+ggplot(dens.data, aes(x = length)) +
+  geom_density(fill = "darkslategray3", color = "darkslategray", alpha = 0.6) + 
+  ggtitle("size distribution of genes upregulated in dPvNP only") +
+  theme_minimal()
+dev.off()
+```
+
+# batch correct for experimental batch and write out
+```{r}
+# add batch to sample info
+dge.counts$samples$batch <- c(rep("B2", 4), rep(c("B1", "B3", "B3"), 4))
+
+# get log cpms for batch correction
+dge.cpm.log <- cpm(dge.counts, normalized.lib.sizes = TRUE, log = TRUE)
+
+batch.cor.counts.norm <- removeBatchEffect(
+	dge.cpm.log, 
+	batch = dge.counts$sample$batch
+	)
+
+# write out batch corrected normalised counts
+write.table(
+  batch.cor.counts.norm,
+  file.path(res.dir, "Nascent_batchcorrected_TMMnorm_counts.txt"),
+  sep = "\t",
+  col.names = NA,
+  row.names = TRUE,
+  quote = FALSE
+)
+
+# plots MDS of batch cor
+col.group <- as.factor(dge.counts$samples$group)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+col.group <- as.character(col.group)
+
+pdf(file.path(plots.dir, "MDS_nascent_TMMnorm_counts_batchCorrected.pdf"))
+MDS = plotMDS(
+  batch.cor.counts.norm,
+  labels = paste0(dge.counts$samples$group, "_", dge.counts$samples$batch), 
+  col = col.group,
+  main = "Nascent batch corrected TMM norm counts"
+  )
+dev.off()
+```
+
+# redo DE with batch correction
+```{r}
+# make dge obj from batch corrected counts
+dge.counts <- DGEList(2^(batch.cor.counts.norm), group = sample.ann$group)
+dge.counts = estimateDisp(dge.counts, design)
+gfit <- glmQLFit(dge.counts, design)
+
+ftest.list <- list()
+
+for(contrast.i in 1:length(colnames(contr.matrix))){
+
+  ftest.list[[contrast.i]] <- glmQLFTest(gfit, contrast = contr.matrix[, contrast.i])
+  ftest.list[[contrast.i]]$table$ensg <- rownames(ftest.list[[contrast.i]]$table)
+  ftest.list[[contrast.i]]$table <- merge(ftest.list[[contrast.i]]$table, bm.ann, by.x = "ensg", by.y = "ensembl_gene_id")
+  # add qvalues to table, order by that and write out
+  qv <- qvalue(ftest.list[[contrast.i]]$table$PValue)
+  ftest.list[[contrast.i]]$table$QValue <- qv$qvalues
+  ftest.list[[contrast.i]]$table <- ftest.list[[contrast.i]]$table[order(ftest.list[[contrast.i]]$table$QValue, decreasing = FALSE),]
+  write.table(
+    ftest.list[[contrast.i]]$table,
+    file.path(res.dir, paste0(colnames(contr.matrix)[contrast.i], "_batchCorrected_ftest_table.txt")),
+    sep = "\t",
+    quote = F,
+    col.names = T,
+    row.names= F
+  )
+}
+names(ftest.list) <- colnames(contr.matrix)
+```
+
+## get sig up in dPvNP, which are not sig in dDvND and not sig up in NPvND
+#```{r}
+## get sig up genes in each comparison
+#dpnp.up <- ftest.list$dPvNP$table$hgnc_symbol[which(ftest.list$dPvNP$table$QValue < 0.05 & ftest.list$dPvNP$table$logFC > 0)]
+#ddnd.sig <- ftest.list$dDvND$table$hgnc_symbol[which(ftest.list$dDvND$table$QValue < 0.05)]
+#npnd.up <- ftest.list$NPvND$table$hgnc_symbol[which(ftest.list$NPvND$table$QValue < 0.05 & ftest.list$NPvND$table$logFC > 0)]
+
+#dpnp.only <- dpnp.up[-which(dpnp.up %in% c(ddnd.sig, npnd.up))]
+#```
+
+# re-defining "reactivating" genes as sig down in NPvND subset for sig up in dPvNP without any sig up in dDvND
+```{r}
+# get sig up genes in each comparison
+npnd.down <- ftest.list$NPvND$table$hgnc_symbol[which(ftest.list$NPvND$table$QValue < 0.05 & ftest.list$NPvND$table$logFC < 0)]
+dpnp.up <- ftest.list$dPvNP$table$hgnc_symbol[which(ftest.list$dPvNP$table$QValue < 0.05 & ftest.list$dPvNP$table$logFC > 0)]
+ddnd.up <- ftest.list$dDvND$table$hgnc_symbol[which(ftest.list$dDvND$table$QValue < 0.05 & ftest.list$dDvND$table$logFC > 0)]
+
+down.sub <- intersect(npnd.down, dpnp.up)
+react.genes <- down.sub[-which(down.sub %in% ddnd.up)]
+```
+
+# save new reactivated genes list as bed file to use with deeptools in proseq data
+```{r}
+react.bed <- dt.bed[which(dt.bed$V4 %in% react.genes), ]
+write.table(
+  react.bed,
+  file.path(bed.dir, "reactivated_genes.bed"),
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# define non-reactivated as sig down NPvND and sig down dPvNP
+```{r}
+dpnp.down <- ftest.list$dPvNP$table$hgnc_symbol[which(ftest.list$dPvNP$table$QValue < 0.05 & ftest.list$dPvNP$table$logFC < 0)]
+
+non.react.genes <- intersect(npnd.down, dpnp.down)
+# remove blank gene name
+non.react.genes <- non.react.genes[-which(non.react.genes == "")]
+
+# make bed of non-reactivated genes and write out
+non.react.bed <- dt.bed[which(dt.bed$V4 %in% non.react.genes), ]
+write.table(
+  non.react.bed,
+  file.path(bed.dir, "nonreactivated_genes.bed"),
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# look at GSEA for above gene list
+```{r}
+dbs <- c("MSigDB_Hallmark_2020", "KEGG_2021_Human", "NCI-Nature_2015", "GO_Molecular_Function_2021", "GO_Cellular_Component_2021", "GO_Biological_Process_2021", "WikiPathway_2021_Human", "RNAseq_Automatic_GEO_Signatures_Human_Up", "RNAseq_Automatic_GEO_Signatures_Human_Down")
+
+# limit to reactivatedgenes
+react.enrich <- enrichr(react.genes, dbs)
+pdf(file.path(plots.dir, "Reactivated_genes_enrichR_plots.pdf"), height = 8, width = 10)
+plotEnrich(react.enrich[[1]], numChar = 65, title = names(react.enrich)[[1]])
+plotEnrich(react.enrich[[2]], numChar = 65, title = names(react.enrich)[[2]])
+plotEnrich(react.enrich[[3]], numChar = 65, title = names(react.enrich)[[3]])
+plotEnrich(react.enrich[[4]], numChar = 65, title = names(react.enrich)[[4]])
+plotEnrich(react.enrich[[5]], numChar = 65, title = names(react.enrich)[[5]])
+plotEnrich(react.enrich[[6]], numChar = 65, title = names(react.enrich)[[6]])
+plotEnrich(react.enrich[[7]], numChar = 65, title = names(react.enrich)[[7]])
+plotEnrich(react.enrich[[8]], numChar = 65, title = names(react.enrich)[[8]])
+plotEnrich(react.enrich[[9]], numChar = 65, title = names(react.enrich)[[9]])
+dev.off()
+```
+
+# look at GSEA for nonreactivated
+```{r}
+non.react.enrich <- enrichr(non.react.genes, dbs)
+pdf(file.path(plots.dir, "Nonreactivated_genes_enrichR_plots.pdf"), height = 8, width = 10)
+plotEnrich(non.react.enrich[[1]], numChar = 65, title = names(non.react.enrich)[[1]])
+plotEnrich(non.react.enrich[[2]], numChar = 65, title = names(non.react.enrich)[[2]])
+plotEnrich(non.react.enrich[[3]], numChar = 65, title = names(non.react.enrich)[[3]])
+plotEnrich(non.react.enrich[[4]], numChar = 65, title = names(non.react.enrich)[[4]])
+plotEnrich(non.react.enrich[[5]], numChar = 65, title = names(non.react.enrich)[[5]])
+plotEnrich(non.react.enrich[[6]], numChar = 65, title = names(non.react.enrich)[[6]])
+plotEnrich(non.react.enrich[[7]], numChar = 65, title = names(non.react.enrich)[[7]])
+plotEnrich(non.react.enrich[[8]], numChar = 65, title = names(non.react.enrich)[[8]])
+plotEnrich(non.react.enrich[[9]], numChar = 65, title = names(non.react.enrich)[[9]])
+dev.off()
+```
+
+# get some structural feature info on reactivated genes
+```{r}
+# how many on each chr
+table(react.bed$V1)
+ 1 10 11 12 13 14 15 16 17 18 19  2 20 21 22  3  4  5  6  7  8  9  X 
+27 12  9 15  1  3  8 10 21  2 29 29 12  6  9 13  5 11 12 21 11 22  7
+
+# make a density plot of gene lengths for react, nonreact, and universe of genes
+gene.length <- data.frame(
+  "length" = c(react.bed$V3 - react.bed$V2, dt.bed$V3 - dt.bed$V2, non.react.bed$V3 - non.react.bed$V2),
+  "genes" = c(rep("reactivating", nrow(react.bed)), rep("universe", nrow(dt.bed)), rep("non-reactivating", nrow(non.react.bed)))
+  )
+dens.data <- gene.length %>% filter(length < 100000)
+
+pdf(file.path(plots.dir, "density_3genesets_length.pdf"))
+ggplot(dens.data, aes(x = length, group = genes, fill = genes)) +
+  geom_density(alpha = 0.2) + 
+  scale_color_viridis(discrete = TRUE) + 
+  scale_fill_viridis(discrete = TRUE) +
+  ggtitle("size distribution of gene groups") +
+  theme_minimal()
+dev.off()
+
+dens.data <- dens.data %>% filter(genes != "universe")
+
+pdf(file.path(plots.dir, "density_2genesets_length.pdf"))
+ggplot(dens.data, aes(x = length, group = genes, fill = genes)) +
+  geom_density(alpha = 0.2) + 
+  scale_color_viridis(discrete = TRUE) + 
+  scale_fill_viridis(discrete = TRUE) +
+  ggtitle("size distribution of gene groups") +
+  theme_minimal()
+dev.off()
+```
+
+# intersect with cytobands to look for pattern in syntenic structure
+```{bash}
+module load bedtools/2.27.1
+
+bedtools intersect -wa -c -a /data/reference/dawson_labs/genomes/GRCh38/cytoBand_nochr.txt -b bed_files/reactivated_genes.bed > bed_files/reactivated_genes_per_cytoband.bed
+```
+
+# make barplots of structural features
+```{r}
+# make barplot of cytobands with more than 1 gene represented
+cbands <- fread(file.path(bed.dir, "reactivated_genes_per_cytoband.bed"))
+cband.bar <- data.frame("counts" = cbands$V6)
+rownames(cband.bar) <- paste0(cbands$V1, cbands$V4)
+cband.bar <- subset(cband.bar, counts > 1)
+
+pdf(file.path(plots.dir, "barplot_reactivated_cytobands.pdf"), height = 7, width = 12)
+#par(mar = c(4, 4, 2, 1))
+barplot(
+  t(cband.bar),
+  col = "darkslategrey",
+  border = "black",
+  ylab = "counts",
+  main = "Cytobands with >1 gene in reactivated list",
+  cex.names = 0.5,
+  las = 2,
+  ylim = c(0, 10)
+)
+dev.off()
+
+# annotate with genomic features and get stats for each
+exon.ensg <- flattenGTF(
+    "/data/reference/dawson_labs/genomes/Hg38/MANE.GRCh38.v1.1.refseq_genomic.gtf",
+    GTF.featureType = "exon",
+    GTF.attrType = "gene_id",
+    method = "merge"
+    )
+num.exon.ensg <- flattenGTF(
+    "/data/reference/dawson_labs/genomes/Hg38/MANE.GRCh38.v1.1.refseq_genomic.gtf",
+    GTF.featureType = "exon",
+    GTF.attrType = "exon_number",
+    method = "merge"
+    )
+utr.ensg <- flattenGTF(
+    "/data/reference/dawson_labs/genomes/Hg38/Homo_sapiens.GRCh38.102.gtf",
+    GTF.featureType = "three_prime_utr",
+    GTF.attrType = "gene_name",
+    method = "merge"
+    )
+
+exon.ann <- merge(exon.ensg, num.exon.ensg, by.x = c("Chr", "Start", "End", "Strand"), by.y = c("Chr", "Start", "End", "Strand"), all = TRUE)
+colnames(exon.ann)[5:6] <- c("GeneName", "ExonNumber")
+
+# make density plot of number of exons in react genes 
+exon.num <- exon.ann %>% group_by(GeneName) %>% summarise(maxExon = max(ExonNumber)) %>% filter(GeneName %in% react.genes & !is.na(maxExon))
+exon.num$maxExon <- as.numeric(exon.num$maxExon)
+
+pdf(file.path(plots.dir, "density_reactivated_exonNumber.pdf"))
+ggplot(exon.num, aes(x = maxExon)) +
+  geom_density(fill = "darkslategray3", color = "darkslategray", alpha = 0.6) + 
+  ggtitle("Number of exons in reactivated genes") +
+  xlim(0, 15) + 
+  theme_minimal()
+dev.off()
+
+# make density plot of lengths of 1st exon & intron, all exons and introns, and 3'UTR
+exon.ann <- exon.ann %>% filter(!is.na(GeneName) & !is.na(ExonNumber))
+exon.ann$ExonNumber <- as.numeric(exon.ann$ExonNumber)
+exon1.length <- exon.ann %>% 
+  filter(GeneName %in% react.genes & ExonNumber == 1 ) %>% 
+  group_by(GeneName) %>% 
+  summarise(exonLength = End-Start)
+all.exon.length <- exon.ann %>% 
+  filter(GeneName %in% react.genes) %>% 
+  group_by(GeneName) %>% 
+  summarise(exonLength = mean(End-Start))
+intron1.length <- NULL
+all.intron.length <- NULL
+for(gene.i in 1:length(react.genes)){
+  gene.sub <- subset(exon.ann, GeneName == react.genes[gene.i])
+  if(nrow(gene.sub) == 0){next}
+  if(gene.sub$Strand[1] == "+"){
+    intron1.length <- c(intron1.length, gene.sub[which(gene.sub$ExonNumber == 2), "Start"] - gene.sub[which(gene.sub$ExonNumber == 1), "End"])
+  } else{
+    intron1.length <- c(intron1.length, gene.sub[which(gene.sub$ExonNumber == 1), "Start"] - gene.sub[which(gene.sub$ExonNumber == 2), "End"])
+  }
+  intron.i.length <- NULL
+  for(exon.i in 1:max(gene.sub$ExonNumber)-1){
+    if(gene.sub$Strand[1] == "+"){
+      intron.i.length <- c(intron.i.length, abs(gene.sub[which(gene.sub$ExonNumber == exon.i+1), "Start"] - gene.sub[which(gene.sub$ExonNumber == exon.i), "End"]))
+    } else{
+      intron.i.length <- c(intron.i.length, gene.sub[which(gene.sub$ExonNumber == exon.i), "Start"] - gene.sub[which(gene.sub$ExonNumber == exon.i+1), "End"])
+    }
+  }
+  all.intron.length <- c(all.intron.length, mean(intron.i.length))
+}
+
+utr.react <- utr.ensg %>% filter(GeneID %in% react.genes)
+
+feature.length <- data.frame(
+  "length" = c(utr.react$End - utr.react$Start, exon1.length$exonLength, all.exon.length$exonLength, intron1.length, all.intron.length),
+  "feature" = c(rep("3_UTR", nrow(utr.react)), rep("first exon", nrow(exon1.length)), rep("all exons", nrow(all.exon.length)), rep("first intron", length(intron1.length)), rep("all introns", length(all.intron.length)))
+  )
+
+pdf(file.path(plots.dir, "density_reactivated_feature_length.pdf"))
+ggplot(feature.length, aes(x = length, group = feature, fill = feature)) +
+  geom_density(alpha = 0.4) + 
+  ggtitle("length (bp) of features (MANE transcripts)") +
+  xlim(0, 1000) +
+  theme_minimal()
+dev.off()
+
+# a bit crowded, also make as ridgeline
+pdf(file.path(plots.dir, "ridgeline_reactivated_feature_length.pdf"))
+ggplot(feature.length, aes(x = length, y = feature, fill = feature)) +
+  geom_density_ridges(alpha = 0.4) + 
+  ggtitle("length (bp) of features (MANE transcripts)") +
+  xlim(0, 1000) +
+  theme_ridges() +
+  theme_minimal() + 
+  theme(legend.position = "none")
+dev.off()
+```
+
+# also look at feature lengths for non-reactivated
+```{r}
+# make density plot of number of exons in react genes 
+non.react.exon.num <- exon.ann %>% group_by(GeneName) %>% summarise(maxExon = max(ExonNumber)) %>% filter(GeneName %in% non.react.genes & !is.na(maxExon))
+non.react.exon.num$maxExon <- as.numeric(non.react.exon.num$maxExon)
+
+pdf(file.path(plots.dir, "density_nonreactivated_exonNumber.pdf"))
+ggplot(non.react.exon.num, aes(x = maxExon)) +
+  geom_density(fill = "darkslategray3", color = "darkslategray", alpha = 0.6) + 
+  ggtitle("Number of exons in non-reactivated genes") +
+  xlim(0, 15) + 
+  theme_minimal()
+dev.off()
+
+# make density plot of lengths of 1st exon & intron, all exons and introns, and 3'UTR
+exon.ann <- exon.ann %>% filter(!is.na(GeneName) & !is.na(ExonNumber))
+exon.ann$ExonNumber <- as.numeric(exon.ann$ExonNumber)
+non.react.exon1.length <- exon.ann %>% 
+  filter(GeneName %in% non.react.genes & ExonNumber == 1 ) %>% 
+  group_by(GeneName) %>% 
+  summarise(exonLength = End-Start)
+non.react.all.exon.length <- exon.ann %>% 
+  filter(GeneName %in% non.react.genes) %>% 
+  group_by(GeneName) %>% 
+  summarise(exonLength = mean(End-Start))
+non.react.intron1.length <- NULL
+non.react.all.intron.length <- NULL
+for(gene.i in 1:length(non.react.genes)){
+  gene.sub <- subset(exon.ann, GeneName == non.react.genes[gene.i])
+  if(nrow(gene.sub) == 0){next}
+  if(gene.sub$Strand[1] == "+"){
+    non.react.intron1.length <- c(non.react.intron1.length, gene.sub[which(gene.sub$ExonNumber == 2), "Start"] - gene.sub[which(gene.sub$ExonNumber == 1), "End"])
+  } else{
+    non.react.intron1.length <- c(non.react.intron1.length, gene.sub[which(gene.sub$ExonNumber == 1), "Start"] - gene.sub[which(gene.sub$ExonNumber == 2), "End"])
+  }
+  intron.i.length <- NULL
+  for(exon.i in 1:max(gene.sub$ExonNumber)-1){
+    if(gene.sub$Strand[1] == "+"){
+      intron.i.length <- c(intron.i.length, abs(gene.sub[which(gene.sub$ExonNumber == exon.i+1), "Start"] - gene.sub[which(gene.sub$ExonNumber == exon.i), "End"]))
+    } else{
+      intron.i.length <- c(intron.i.length, gene.sub[which(gene.sub$ExonNumber == exon.i), "Start"] - gene.sub[which(gene.sub$ExonNumber == exon.i+1), "End"])
+    }
+  }
+  non.react.all.intron.length <- c(non.react.all.intron.length, mean(intron.i.length))
+}
+
+utr.non.react <- utr.ensg %>% filter(GeneID %in% non.react.genes)
+
+non.react.feature.length <- data.frame(
+  "length" = c(utr.non.react$End - utr.non.react$Start, non.react.exon1.length$exonLength, non.react.all.exon.length$exonLength, non.react.intron1.length, non.react.all.intron.length),
+  "feature" = c(rep("3_UTR", nrow(utr.non.react)), rep("first exon", nrow(non.react.exon1.length)), rep("all exons", nrow(non.react.all.exon.length)), rep("first intron", length(non.react.intron1.length)), rep("all introns", length(non.react.all.intron.length)))
+  )
+
+pdf(file.path(plots.dir, "density_nonreactivated_feature_length.pdf"))
+ggplot(non.react.feature.length, aes(x = length, group = feature, fill = feature)) +
+  geom_density(alpha = 0.4) + 
+  ggtitle("length (bp) of features (MANE transcripts)") +
+  xlim(0, 1000) +
+  theme_minimal()
+dev.off()
+
+# a bit crowded, also make as ridgeline
+pdf(file.path(plots.dir, "ridgeline_nonreactivated_feature_length.pdf"))
+ggplot(non.react.feature.length, aes(x = length, y = feature, fill = feature)) +
+  geom_density_ridges(alpha = 0.4) + 
+  ggtitle("length (bp) of features (MANE transcripts)") +
+  xlim(0, 1000) +
+  theme_ridges() +
+  theme_minimal() + 
+  theme(legend.position = "none")
+dev.off()
+```
+
+# make line plots for new data
+```{r}
+# use batch corrected normalised counts
+line.data <- data.frame(
+  replicate = c(rep("3_1", 4), rep(c("5_1", "5_2", "5_3"), 4)),
+  dTAG = c("DMSO_dTAG-V", "P300i_dTAG-V", "DMSO_dTAG-NEG", "P300i_dTAG-NEG", rep("DMSO_dTAG-V", 3), rep("P300i_dTAG-V", 3), rep("DMSO_dTAG-NEG", 3), rep("P300i_dTAG-NEG", 3)),
+  counts = batch.cor.counts.norm["ENSG00000136997", ]
+)
+colnames(line.data)[3] <- "TMMcounts"
+
+pdf(file.path(plots.dir, "lineplot_batchCor_all_sample_TMMcounts_MYC.pdf"))
+ggplot(line.data, aes(x = dTAG, y = TMMcounts, group = replicate)) +
+  geom_line(aes(color = replicate)) +
+  geom_point(aes(color = replicate)) + 
+  scale_color_brewer(palette = "Dark2") + 
+  theme_classic() +
+  labs(title = "MYC batch-corrected nascent TMM counts")
+dev.off()
+
+# all genes, total counts
+line.data$TMMcounts <- colSums(batch.cor.counts.norm)
+
+pdf(file.path(plots.dir, "lineplot_BatchCor_all_sample_TMMcounts_allGenes.pdf"))
+ggplot(line.data, aes(x = dTAG, y = TMMcounts, group = replicate)) +
+  geom_line(aes(color = replicate)) +
+  geom_point(aes(color = replicate)) + 
+  scale_color_brewer(palette = "Dark2") + 
+  theme_classic() +
+  labs(title = "All genes batch-corrected nascent TMM counts")
+dev.off()
+
+# sig up in dPvNP only
+dpnp.ensg <- ftest$table$ensg[which(ftest$table$hgnc_symbol %in% dpnp.only)]
+line.data$TMMcounts <- colSums(batch.cor.counts.norm[dpnp.ensg, ])
+
+pdf(file.path(plots.dir, "lineplot_BatchCor_all_sample_TMMcounts_dPvNPsigUp.pdf"))
+ggplot(line.data, aes(x = dTAG, y = TMMcounts, group = replicate)) +
+  geom_line(aes(color = replicate)) +
+  geom_point(aes(color = replicate)) + 
+  scale_color_brewer(palette = "Dark2") + 
+  theme_classic() +
+  labs(title = "dPvNP only significantly upregulated genes,\nbatch-corrected nascent TMM counts")
+dev.off()
+```
+
+# rerun star to get spliced alignment tag and use stringtie to quantify transcripts including any novel
+```{bash}
+for fq in /pipeline/Runs/NovaSeq/230420_A01524_0115_AH7FGKDSX7/ProjectFolders/Project_Dane-Vassiliadis/Sample_[3-5]*/*L002_R1_001.fastq.gz
+do
+bname=`basename $fq L002_R1_001.fastq.gz`
+dname=`dirname $fq`
+sbatch scripts/star_stringtie.sbatch $fq ${dname}/${bname}L002_R2_001.fastq.gz ${dname}/${bname}L003_R1_001.fastq.gz ${dname}/${bname}L003_R2_001.fastq.gz
+done
+
+for fq in /pipeline/Runs/NovaSeq/230420_A01524_0115_AH7FGKDSX7/ProjectFolders/Project_Dane-Vassiliadis/Sample_[3-5]*/*L002_R1_001.fastq.gz
+do
+sbatch scripts/star_stringtie.sbatch $fq 
+done
+```
+
+# make a saf for 300bp bin at end/beginning of each region around exon 1/2 splice site and get counts from all bams
+```{r}
+myc.exon.saf <- data.frame(
+  "GeneID" = c("MYC_exon1_end", "MYC_intron1_start", "MYC_intron1_end", "MYC_exon2_start"),
+  "Chr" = rep(8, 4),
+  "Start" = c(127736323, 127736624, 127737947, 127738248),
+  "End" = c(127736623, 127736924, 127738247, 127738548),
+  "Strand" = rep("+", 4)
+)
+
+all.bams <- list.files(bam.dir, pattern = "sort.dedup.bam$", full.names = TRUE)
+
+myc.exon.counts <- featureCounts(
+  all.bams, 
+  annot.ext = myc.exon.saf, 
+  isPairedEnd = TRUE, 
+  countReadPairs = TRUE,
+  useMetaFeatures = FALSE
+  )
+colnames(myc.exon.counts$counts) <- gsub(".sort.dedup.bam", "", colnames(myc.exon.counts$counts))
+
+# get nascent only and normalise with TMM for all reads
+myc.exon.norm <- as.matrix(myc.exon.counts$counts[, grepl("Nascent", colnames(myc.exon.counts$counts))]) %*% diag(dge.counts$samples$lib.size/1000000)
+colnames(myc.exon.norm) <- colnames(myc.exon.counts$counts[, grepl("Nascent", colnames(myc.exon.counts$counts))])
+
+# reorder and make heatmap  
+myc.exon.heat <- log10(myc.exon.norm[, c(3, 11:13, 4, 14:16, 1, 5:7, 2, 8:10)])
+
+pdf(file.path(plots.dir, "Heatmap_MYCexonintron_TMMcounts.pdf"))
+Heatmap(myc.exon.heat, name = "log10(TMM counts)", cluster_columns = FALSE, cluster_rows = FALSE, row_names_gp = gpar(fontsize = 6), column_names_gp = gpar(fontsize = 6), col = viridis(n = 10))
+dev.off()
+
+myc.exon.bar <- myc.exon.norm[, c(3, 11:13, 4, 14:16, 1, 5:7, 2, 8:10)]
+# also make bar plot of counts
+pdf(file.path(plots.dir, "barplot_MYCexonintron_TMMcounts.pdf"), height = 5, width = 12)
+par(mar = c(5, 6, 1, 1))
+barplot(
+  myc.exon.bar,
+  col = c("turquoise4", "darkorange2", "mediumpurple4", "forestgreen"),
+  border = "black",
+  xlab = "TMM normalised read counts",
+  legend = TRUE,
+  horiz = TRUE,
+  las = 2,
+  cex.names = 0.6
+)
+dev.off()
+
+# make proportional bar plot
+myc.exon.prop.bar <- prop.table(myc.exon.bar, 2)
+pdf(file.path(plots.dir, "barplot_MYCexonintron_proportion.pdf"), height = 5, width = 8)
+par(mar = c(6, 4, 1, 9))
+barplot(
+  myc.exon.prop.bar,
+  col = c("turquoise4", "darkorange2", "mediumpurple4", "forestgreen"),
+  border = "black",
+  ylab = "Proportion of reads",
+  legend.text = TRUE,
+  args.legend = list(x = "topright", inset = c(-0.32, 0)),
+  las = 2,
+  cex.names = 0.6
+)
+dev.off()
+```
+
+# make structural plots for universe of genes as done for dPvNP only
+```{r}
+uni.exon.num <- exon.ann %>% group_by(GeneName) %>% summarise(maxExon = max(ExonNumber)) %>% filter( !is.na(maxExon))
+uni.exon.num$maxExon <- as.numeric(uni.exon.num$maxExon)
+
+pdf(file.path(plots.dir, "density_universe_exonNumber.pdf"))
+ggplot(uni.exon.num, aes(x = maxExon)) +
+  geom_density(fill = "darkslategray3", color = "darkslategray", alpha = 0.6) + 
+  ggtitle("Number of exons in universe of genes") +
+  xlim(0, 15) + 
+  theme_minimal()
+dev.off()
+
+# make density plot of lengths of 1st exon & intron, all exons and introns, and 3'UTR
+uni.exon1.length <- exon.ann %>% 
+  filter(ExonNumber == 1) %>% 
+  group_by(GeneName) %>% 
+  summarise(exonLength = End-Start)
+uni.all.exon.length <- exon.ann %>% 
+  group_by(GeneName) %>% 
+  summarise(exonLength = mean(End-Start))
+uni.intron1.length <- NULL
+uni.all.intron.length <- NULL
+for(gene.i in 1:length(unique(exon.ann$GeneName))){
+  gene.sub <- subset(exon.ann, GeneName == unique(exon.ann$GeneName)[gene.i])
+  if(nrow(gene.sub) == 0){next}
+  if(gene.sub$Strand[1] == "+"){
+    uni.intron1.length <- c(uni.intron1.length, gene.sub[which(gene.sub$ExonNumber == 2), "Start"] - gene.sub[which(gene.sub$ExonNumber == 1), "End"])
+  } else{
+    uni.intron1.length <- c(uni.intron1.length, gene.sub[which(gene.sub$ExonNumber == 1), "Start"] - gene.sub[which(gene.sub$ExonNumber == 2), "End"])
+  }
+  intron.i.length <- NULL
+  for(exon.i in 1:max(gene.sub$ExonNumber)-1){
+    if(gene.sub$Strand[1] == "+"){
+      intron.i.length <- c(intron.i.length, gene.sub[which(gene.sub$ExonNumber == exon.i+1), "Start"] - gene.sub[which(gene.sub$ExonNumber == exon.i), "End"])
+    } else{
+      intron.i.length <- c(intron.i.length, gene.sub[which(gene.sub$ExonNumber == exon.i), "Start"] - gene.sub[which(gene.sub$ExonNumber == exon.i+1), "End"])
+    }
+  }
+  uni.all.intron.length <- c(uni.all.intron.length, mean(intron.i.length))
+}
+
+feature.length <- data.frame(
+  "length" = c(utr.ensg$End - utr.ensg$Start, uni.exon1.length$exonLength, uni.all.exon.length$exonLength, uni.intron1.length, uni.all.intron.length),
+  "feature" = c(rep("3_UTR", nrow(utr.ensg)), rep("first exon", nrow(uni.exon1.length)), rep("all exons", nrow(uni.all.exon.length)), rep("first intron", length(uni.intron1.length)), rep("all introns", length(uni.all.intron.length)))
+  )
+
+pdf(file.path(plots.dir, "density_universe_feature_length.pdf"))
+ggplot(feature.length, aes(x = length, group = feature, fill = feature)) +
+  geom_density(alpha = 0.4) + 
+  ggtitle("length (bp) of features (universe of MANE transcripts)") +
+  xlim(0, 1000) +
+  theme_minimal()
+dev.off()
+
+# a bit crowded, also make as ridgeline
+pdf(file.path(plots.dir, "ridgeline_universe_feature_length.pdf"))
+ggplot(feature.length, aes(x = length, y = feature, fill = feature)) +
+  geom_density_ridges(alpha = 0.4) + 
+  ggtitle("length (bp) of features (universe of MANE transcripts)") +
+  xlim(0, 1000) +
+  theme_ridges() +
+  theme_minimal() + 
+  theme(legend.position = "none")
+dev.off()
+```
+
+# check for any novel transcripts identified at MYC & P300 loci by stringtie, make gtfs of novel transcripts for each
+```{r}
+gtf.files <- list.files("stringtie", pattern = "_quant.gtf", full.names = TRUE)
+myc.gtf <- data.frame()
+p300.gtf <- data.frame()
+
+for(gtf in gtf.files[23:32]){
+  # parse gtf and get novel transcripts
+  x.str <- fread(gtf, skip = 2)
+  x.substr <- strsplit(x.str$V9, "; ")
+  str.novel <- NULL
+  for(i in 1:length(x.substr)){
+    if(length(x.substr[[i]]) <= 5){
+      str.novel <- rbind(str.novel, x.str[i])
+    }
+  }
+  # add sample name to know which sample novel tx originates from
+  str.novel$sample <- basename(gtf)
+  # subset for MYC and add to MYC gtf
+  myc.sub <- subset(str.novel, V1 == 8 & V4 > 127735000 & V5 < 127743000)
+  myc.gtf <- rbind(myc.gtf, myc.sub)
+  # now for P300
+  p300.sub <- subset(str.novel, V1 == 22 & V4 > 41092000 & V5 < 41181000)
+  p300.gtf <- rbind(p300.gtf, p300.sub)
+}
+
+colnames(myc.gtf)[1:9] <- c("chr", "source", "feature", "start", "end", "score", "strand", "frame", "attribute")
+colnames(p300.gtf)[1:9] <- c("chr", "source", "feature", "start", "end", "score", "strand", "frame", "attribute")
+
+# write out novel gtfs
+write.table(
+  myc.gtf,
+  "stringtie/MYC_novel_transcripts.gtf",
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+write.table(
+  p300.gtf,
+  "stringtie/P300_novel_transcripts.gtf",
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# submit job for heatmaps on dPvNP only genes
+```{bash}
+sbatch scripts/DTMat_GeneRegion_dPvNPonlyUp_dPmedSort.sbatch
+```
+
+# merge bams and make bigwigs for deeptools
+```{bash}
+sbatch scripts/mergeBamCov.sbatch bams/3dD-1-Nascent_S419.sort.dedup.bam bams/5dD-1-Nascent_S415.sort.dedup.bam bams/5dD-2-Nascent_S391.sort.dedup.bam bams/5dD-3-Nascent_S395.sort.dedup.bam dD-Nascent
+sbatch scripts/mergeBamCov.sbatch bams/3dP-1-Nascent_S420.sort.dedup.bam bams/5dP-1-Nascent_S416.sort.dedup.bam bams/5dP-2-Nascent_S392.sort.dedup.bam bams/5dP-3-Nascent_S396.sort.dedup.bam dP-Nascent
+sbatch scripts/mergeBamCov.sbatch bams/3ND-1-Nascent_S417.sort.dedup.bam bams/5ND-1-Nascent_S400.sort.dedup.bam bams/5ND-2-Nascent_S421.sort.dedup.bam bams/5ND-3-Nascent_S393.sort.dedup.bam ND-Nascent
+sbatch scripts/mergeBamCov.sbatch bams/3NP-1-Nascent_S418.sort.dedup.bam bams/5NP-1-Nascent_S411.sort.dedup.bam bams/5NP-2-Nascent_S390.sort.dedup.bam bams/5NP-3-Nascent_S394.sort.dedup.bam NP-Nascent
+```
+
+# submit heatmap job for merged bams
+```{bash}
+sbatch scripts/DTMat_GeneRegion_dPvNPonlyUp_dPmedSort_merged.sbatch
+```
+
+# also get LFC bigwigs and make heatmaps
+```{bash}
+sbatch scripts/DeeptoolsBamComp.sbatch bams/dP-Nascent.merged.bam bams/NP-Nascent.merged.bam dPvNP
+sbatch scripts/DeeptoolsBamComp.sbatch bams/dD-Nascent.merged.bam bams/ND-Nascent.merged.bam dDvND
+sbatch scripts/DeeptoolsBamComp.sbatch bams/NP-Nascent.merged.bam bams/ND-Nascent.merged.bam NPvND
+
+sbatch scripts/DTMat_GeneRegion_dPvNPonlyUp_LFC_merged.sbatch
+```
+
+# change to +/-5kb and add profile plots, also make these for all genes
+```{bash}
+sbatch scripts/DTMat_GeneRegion_dPvNPonlyUp_dPmedSort_merged.sbatch
+sbatch scripts/DTMat_GeneRegion_dPvNPonlyUp_LFC_merged.sbatch
+
+sbatch scripts/DTMat_GeneRegion_allGenes_dPmedSort_merged.sbatch
+sbatch scripts/DTMat_GeneRegion_allGenes_LFC_merged.sbatch
+```
+
+# make heatmaps on new reactivated genes list
+```{bash}
+sbatch scripts/DTMat_GeneRegion_reactivated_NDmedSort_merged.sbatch
+sbatch scripts/DTMat_GeneRegion_reactivated_LFC_merged.sbatch
+```
+
+# more analysis of reactivated vs non-reactivated metrics
+
+# first look at number of introns
+```{r}
+react.intron.num <- exon.num
+react.intron.num$maxIntron <- react.intron.num$maxExon - 1
+
+non.react.intron.num <- exon.ann %>% 
+  group_by(GeneName) %>% 
+  summarise(maxExon = max(ExonNumber)) %>% 
+  filter(GeneName %in% non.react.genes & !is.na(maxExon))
+non.react.intron.num$maxExon <- as.numeric(non.react.intron.num$maxExon)
+non.react.intron.num$maxIntron <- non.react.intron.num$maxExon - 1
+
+# combine together for density plot
+intron.num <- data.frame(
+  "length" = c(react.intron.num$maxIntron, non.react.intron.num$maxIntron),
+  "geneset" = c(rep("reactivated", nrow(react.intron.num)), rep("non-reactivated", nrow(non.react.intron.num)))
+  )
+
+pdf(file.path(plots.dir, "density_intronNumber.pdf"))
+ggplot(intron.num, aes(x = length, group = geneset, fill = geneset)) +
+  geom_density(alpha = 0.4) + 
+  ggtitle("Number of introns in MANE transcripts") +
+  xlim(0, 30) +
+  theme_minimal()
+dev.off()
+
+# add gene universe
+uni.intron.num <- exon.ann %>% group_by(GeneName) %>% summarise(maxExon = max(ExonNumber)) %>% filter(!is.na(maxExon))
+uni.intron.num$maxExon <- as.numeric(uni.intron.num$maxExon)
+uni.intron.num$maxIntron <- uni.intron.num$maxExon - 1
+
+intron.num <- data.frame(
+  "length" = c(react.intron.num$maxIntron, non.react.intron.num$maxIntron, uni.intron.num$maxIntron),
+  "geneset" = c(rep("reactivated", nrow(react.intron.num)), rep("non-reactivated", nrow(non.react.intron.num)), rep("universe", nrow(uni.intron.num)))
+  )
+
+pdf(file.path(plots.dir, "density_intronNumber_3sets.pdf"))
+ggplot(intron.num, aes(x = length, group = geneset, fill = geneset)) +
+  geom_density(alpha = 0.4) + 
+  ggtitle("Number of introns in MANE transcripts") +
+  xlim(0, 30) +
+  theme_minimal()
+dev.off()
+```
+
+# get GC content for each group
+# first downloaded known gene sequences fasta from UCSC (/data/reference/dawson_labs/genomes/Hg38/Hg38_knownGene_sequence.fa), now get GC content for each with awk
+```{bash}
+awk ' \
+BEGIN { \
+    FS=""; \
+    cg=0; \
+    t=0; \
+} \
+{ \
+    if ($1 != ">") { \
+        for (i = 1; i <= NF; i++) { \
+            if ($i ~ /[ACTGactg]/) { \
+                t++;
+            } \
+            if ($i ~ /[CGcg]/) { \
+                cg++;
+            } \
+        } \
+    } \
+    else { \
+        if (t > 0) { \
+            print h"\t"cg"\t"t"\t"(cg/t); \
+            cg = 0; \
+            t = 0; \
+        } \
+        h = substr($0,2); \
+    } \
+} \
+END { \
+    print h"\t"cg"\t"t"\t"(cg/t); \
+}' /data/reference/dawson_labs/genomes/Hg38/Hg38_knownGene_sequence.fa > /data/reference/dawson_labs/genomes/Hg38/Hg38_knownGene_GCcontent.txt
+```
+
+# use above file to make GC distribution plots for each group
+```{r}
+# read in file and limit col1 to tx id only
+gc.con <- fread("/data/reference/dawson_labs/genomes/Hg38/Hg38_knownGene_GCcontent.txt")
+gc.con$V1 <- substr(gc.con$V1, 16, 30)
+
+# map gene names to tx ids
+enst.ann <- fread("/data/reference/dawson_labs/biomart_annotations/Hsapiens/Hg38_ENST_symbol_ann.txt")
+gc.con <- merge(gc.con, enst.ann, by.x = "V1", by.y = "ENST")
+
+react.gc <- gc.con[which(gc.con$Symbol %in% react.genes), ]
+non.react.gc <- gc.con[which(gc.con$Symbol %in% non.react.genes), ]
+
+### very limited number mapped (25 react & 45 non-react), but mean for these is within <1% so probably not worth pursuing
+```
+
+# first calculate elongation across MYC
+```{r}
+# get saf for every 500 bp in myc
+myc.500 <- seq(127735434, 127742951, by = 500)
+myc.saf <- data.frame(
+  "GeneID" = paste0("MYC_", seq(1, length(myc.500), 1)), 
+  "Chr" = 8, 
+  "Start" = myc.500, 
+  "End" = myc.500 + 499, 
+  "Strand" = "+"
+  )
+# remove bin overlapping TES
+myc.saf <- myc.saf[-16, ]
+
+bam.files <- list.files(bam.dir, pattern = "Nascent_S[0-9][0-9][0-9].sort.dedup.bam$", full.names = TRUE)
+
+myc.500.counts <- featureCounts(
+  bam.files,
+  annot.ext = myc.saf,
+  allowMultiOverlap = FALSE,
+  largestOverlap = TRUE, 
+  isPairedEnd = TRUE, 
+  requireBothEndsMapped = TRUE,
+  countChimericFragments = FALSE
+)
+colnames(myc.500.counts$counts) <- gsub(".sort.dedup.bam", "", colnames(myc.500.counts$counts))
+
+# normalise with TMM, batch corrected for all reads
+myc.500.norm <- as.matrix(myc.500.counts$counts) %*% diag(dge.counts$samples$lib.size/1000000)
+colnames(myc.500.norm) <- colnames(myc.500.counts$counts)
+
+# get mean across replicates
+myc.500.mean <- data.frame(
+  "dD_LATE" = rowMeans(myc.500.norm[, grepl("dD", colnames(myc.500.norm))]), 
+  "dP_LATE" = rowMeans(myc.500.norm[, grepl("dP", colnames(myc.500.norm))]), 
+  "ND_LATE" = rowMeans(myc.500.norm[, grepl("ND", colnames(myc.500.norm))]),
+  "NP_LATE" = rowMeans(myc.500.norm[, grepl("NP", colnames(myc.500.norm))])
+  )
+
+write.table(
+  myc.500.mean,
+  file.path(res.dir, "MYC_500bins_mean_counts.txt"),
+  sep = "\t",
+  col.names = NA,
+  row.names = TRUE,
+  quote = FALSE
+)
+```
+
+# now calculate with 100 bp bins
+```{r}
+# get saf for every 100 bp in myc
+myc.100 <- seq(127735434, 127742951, by = 100)
+myc.saf <- data.frame(
+  "GeneID" = paste0("MYC_", seq(1, length(myc.100), 1)), 
+  "Chr" = 8, 
+  "Start" = myc.100, 
+  "End" = myc.100 + 99, 
+  "Strand" = "+"
+  )
+# remove bin overlapping TES
+myc.saf <- myc.saf[-76, ]
+
+myc.100.counts <- featureCounts(
+  bam.files,
+  annot.ext = myc.saf,
+  allowMultiOverlap = FALSE,
+  largestOverlap = TRUE, 
+  isPairedEnd = TRUE, 
+  requireBothEndsMapped = TRUE,
+  countChimericFragments = FALSE
+)
+colnames(myc.100.counts$counts) <- gsub(".sort.dedup.bam", "", colnames(myc.100.counts$counts))
+
+# normalise with TMM, batch corrected for all reads
+myc.100.norm <- as.matrix(myc.100.counts$counts) %*% diag(dge.counts$samples$lib.size/1000000)
+colnames(myc.100.norm) <- colnames(myc.100.counts$counts)
+
+# get mean across replicates
+myc.100.mean <- data.frame(
+  "dD_LATE" = rowMeans(myc.100.norm[, grepl("dD", colnames(myc.100.norm))]), 
+  "dP_LATE" = rowMeans(myc.100.norm[, grepl("dP", colnames(myc.100.norm))]), 
+  "ND_LATE" = rowMeans(myc.100.norm[, grepl("ND", colnames(myc.100.norm))]),
+  "NP_LATE" = rowMeans(myc.100.norm[, grepl("NP", colnames(myc.100.norm))])
+  )
+
+write.table(
+  myc.100.mean,
+  file.path(res.dir, "MYC_100bins_mean_counts.txt"),
+  sep = "\t",
+  col.names = NA,
+  row.names = TRUE,
+  quote = FALSE
+)
+```
+
+# for elongation index get reads per 500bp bin for each geneset of interest
+```{r}
+# make saf of 500bp bins for each set of genes, then get feature counts over those
+react.500.saf <- NULL
+for(gene.i in 1:nrow(react.bed)){
+  seq.500 <- seq(as.numeric(react.bed[gene.i, 2]), as.numeric(react.bed[gene.i, 3]), by = 500)
+  gene.saf <- cbind(paste0(react.bed[gene.i, 4], "_", seq(1, length(seq.500), 1)), react.bed[gene.i, 1], seq.500, seq.500 + 499, react.bed[gene.i, 6])
+  # remove bin overlapping TES
+  gene.saf <- gene.saf[-length(seq.500), ]
+  react.500.saf <- rbind(react.500.saf, gene.saf)
+}
+colnames(react.500.saf) <- c("GeneID", "Chr", "Start", "End", "Strand")
+
+non.react.500.saf <- NULL
+for(gene.i in 1:nrow(non.react.bed)){
+  seq.500 <- seq(as.numeric(non.react.bed[gene.i, 2]), as.numeric(non.react.bed[gene.i, 3]), by = 500)
+  gene.saf <- cbind(paste0(non.react.bed[gene.i, 4], "_", seq(1, length(seq.500), 1)), non.react.bed[gene.i, 1], seq.500, seq.500 + 499, non.react.bed[gene.i, 6])
+  # remove bin overlapping TES
+  gene.saf <- gene.saf[-length(seq.500), ]
+  non.react.500.saf <- rbind(non.react.500.saf, gene.saf)
+}
+colnames(non.react.500.saf) <- c("GeneID", "Chr", "Start", "End", "Strand")
+
+bam.files <- list.files(bam.dir, pattern = "Nascent_S[0-9][0-9][0-9].sort.dedup.bam$", full.names = TRUE)
+
+react.500.counts <- featureCounts(
+  bam.files,
+  annot.ext = react.500.saf,
+  allowMultiOverlap = FALSE,
+  largestOverlap = TRUE, 
+  isPairedEnd = TRUE, 
+  requireBothEndsMapped = TRUE,
+  countChimericFragments = FALSE
+)
+colnames(react.500.counts$counts) <- gsub(".sort.dedup.bam", "", colnames(react.500.counts$counts))
+
+non.react.500.counts <- featureCounts(
+  bam.files,
+  annot.ext = non.react.500.saf,
+  allowMultiOverlap = FALSE,
+  largestOverlap = TRUE, 
+  isPairedEnd = TRUE, 
+  requireBothEndsMapped = TRUE,
+  countChimericFragments = FALSE
+)
+colnames(non.react.500.counts$counts) <- gsub(".sort.dedup.bam", "", colnames(non.react.500.counts$counts))
+
+react.500.mean <- data.frame(
+  "dD_LATE" = rowMeans(react.500.counts$counts[, grepl("dD", colnames(react.500.counts$counts))]), 
+  "dP_LATE" = rowMeans(react.500.counts$counts[, grepl("dP", colnames(react.500.counts$counts))]), 
+  "ND_LATE" = rowMeans(react.500.counts$counts[, grepl("ND", colnames(react.500.counts$counts))]),
+  "NP_LATE" = rowMeans(react.500.counts$counts[, grepl("NP", colnames(react.500.counts$counts))])
+  )
+
+non.react.500.mean <- data.frame(
+  "dD_LATE" = rowMeans(non.react.500.counts$counts[, grepl("dD", colnames(non.react.500.counts$counts))]), 
+  "dP_LATE" = rowMeans(non.react.500.counts$counts[, grepl("dP", colnames(non.react.500.counts$counts))]), 
+  "ND_LATE" = rowMeans(non.react.500.counts$counts[, grepl("ND", colnames(non.react.500.counts$counts))]),
+  "NP_LATE" = rowMeans(non.react.500.counts$counts[, grepl("NP", colnames(non.react.500.counts$counts))])
+  )
+
+# write out counts to use with PROseq data
+write.table(
+  react.500.mean,
+  file.path(res.dir, "react_genes_500bins_mean_counts.txt"),
+  sep = "\t",
+  col.names = NA,
+  row.names = TRUE,
+  quote = FALSE
+)
+
+write.table(
+  non.react.500.mean,
+  file.path(res.dir, "nonreact_genes_500bins_mean_counts.txt"),
+  sep = "\t",
+  col.names = NA,
+  row.names = TRUE,
+  quote = FALSE
+)
+```
+
+# subset dPvNP ftest table by react genes and write out to send to Jesse
+```{r}
+dpnp.react <- ftest.list$dPvNP$table[which(ftest.list$dPvNP$table$hgnc_symbol %in% react.bed$V4), ]
+write.table(
+  dpnp.react,
+  file.path(res.dir, "dPvNP_ftest_table_reactGenes.txt"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# for each group calculate introns as percent of total length
+```{r}
+exon.ann$ExonLength <- exon.ann$End - exon.ann$Start
+
+react.total.exon.length <- exon.ann %>% 
+  filter(GeneName %in% react.genes) %>%
+  group_by(GeneName) %>% 
+  summarise(total.exon.length = sum(ExonLength))
+react.gene.length <- exon.ann %>% 
+  filter(GeneName %in% react.genes) %>%
+  group_by(GeneName) %>% 
+  summarise(start = min(Start), end = max(End), length = max(End) - min(Start))
+react.gene.length$intron.prop <- (react.gene.length$length - react.total.exon.length$total.exon.length) / react.gene.length$length
+
+non.react.total.exon.length <- exon.ann %>% 
+  filter(GeneName %in% non.react.genes) %>%
+  group_by(GeneName) %>% 
+  summarise(total.exon.length = sum(ExonLength))
+non.react.gene.length <- exon.ann %>% 
+  filter(GeneName %in% non.react.genes) %>%
+  group_by(GeneName) %>% 
+  summarise(start = min(Start), end = max(End), length = max(End) - min(Start))
+non.react.gene.length$intron.prop <- (non.react.gene.length$length - non.react.total.exon.length$total.exon.length) / non.react.gene.length$length
+
+uni.total.exon.length <- exon.ann %>% 
+  group_by(GeneName) %>% 
+  summarise(total.exon.length = sum(ExonLength))
+uni.gene.length <- exon.ann %>% 
+  group_by(GeneName) %>% 
+  summarise(start = min(Start), end = max(End), length = max(End) - min(Start))
+uni.gene.length$intron.prop <- (uni.gene.length$length - uni.total.exon.length$total.exon.length) / uni.gene.length$length
+
+# make density plot of 3 groups
+intron.prop <- data.frame(
+  "intron_proportion" = c(react.gene.length$intron.prop, non.react.gene.length$intron.prop, uni.gene.length$intron.prop),
+  "geneset" = c(rep("reactivated", nrow(react.gene.length)), rep("non-reactivated", nrow(non.react.gene.length)), rep("universe", nrow(uni.gene.length)))
+  )
+
+pdf(file.path(plots.dir, "density_intronProportion.pdf"))
+ggplot(intron.prop, aes(x = intron_proportion, group = geneset, fill = geneset)) +
+  geom_density(alpha = 0.4) + 
+  ggtitle("Introns as proportion of gene length (MANE transcripts)") +
+  xlim(0, 1) +
+  theme_minimal()
+dev.off()
+
+# write out exon.ann for use with PROseq
+write.table(
+  exon.ann,
+  file.path(bed.dir, "exon_ann.txt"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# look at steady state expression for each of the gene groups
+# first get normalised batch corrected counts for total fraction
+```{r}
+# get all nascent 
+tot.files <- list.files(counts.dir, pattern = "Total")
+
+# remake sample annotation with all
+tot.sample.ann <- data.frame(
+  "files" = tot.files, 
+  "samples" = gsub(".count", "", tot.files), 
+  "tag" = c(rep("dTAG-V", 2), rep("dTAG-NEG", 2), rep("dTAG-V", 6), rep("dTAG-NEG", 6)),
+  "treatment" = c(rep(c("DMSO", "P300i"), 2), rep("DMSO", 3), rep("P3001", 3), rep("DMSO", 3), rep("P3001", 3)),
+  "replicate" = c(rep("3_1", 4), rep(c("5_1", "5_2", "5_3"), 4)),
+  "group" = c("dD", "dP", "ND", "NP", rep("dD", 3), rep("dP", 3), rep("ND", 3), rep("NP", 3))
+  )
+tot.sample.ann
+
+tot.dge.counts = readDGE(
+  file = tot.sample.ann$files, 
+  path = counts.dir,
+  group = tot.sample.ann$group
+  )
+```
+
+# Filtering out genes with low counts & not useful
+```{r}
+noint <- rownames(tot.dge.counts$counts) %in% c("__no_feature", "__ambiguous", "__too_low_aQual","__not_aligned","__alignment_not_unique")
+tot.counts.cpms <- cpm(tot.dge.counts$counts)
+# start with minimal filter
+keep <- rowSums(tot.counts.cpms > 1 ) >= 2 & !noint
+dim(tot.dge.counts$counts)
+tot.dge.counts$counts <- tot.dge.counts$counts[keep,]
+dim(tot.dge.counts$counts)
+```
+
+# calc TMM norm and write out file
+```{r}
+tot.dge.counts <- calcNormFactors(tot.dge.counts, method = "TMM")
+
+# multiply counts by norm factors
+tot.counts.norm <- tot.dge.counts$counts%*%diag(tot.dge.counts$samples$norm.factors)
+colnames(tot.counts.norm) <- colnames(tot.dge.counts$counts)
+```
+
+# estimate dispersion and get DE
+```{r}
+tot.dge.counts = estimateDisp(tot.dge.counts, design)
+tot.gfit <- glmQLFit(tot.dge.counts, design)
+
+tot.ftest.list <- list()
+
+for(contrast.i in 1:length(colnames(contr.matrix))){
+
+  tot.ftest.list[[contrast.i]] <- glmQLFTest(tot.gfit, contrast = contr.matrix[, contrast.i])
+  tot.ftest.list[[contrast.i]]$table$ensg <- rownames(tot.ftest.list[[contrast.i]]$table)
+  tot.ftest.list[[contrast.i]]$table <- merge(tot.ftest.list[[contrast.i]]$table, bm.ann, by.x = "ensg", by.y = "ensembl_gene_id")
+  # add qvalues to table, order by that and write out
+  qv <- qvalue(tot.ftest.list[[contrast.i]]$table$PValue)
+  tot.ftest.list[[contrast.i]]$table$QValue <- qv$qvalues
+  tot.ftest.list[[contrast.i]]$table <- tot.ftest.list[[contrast.i]]$table[order(tot.ftest.list[[contrast.i]]$table$QValue, decreasing = FALSE),]
+  write.table(
+    tot.ftest.list[[contrast.i]]$table,
+    file.path(res.dir, paste0(colnames(contr.matrix)[contrast.i], "_Total_ftest_table.txt")),
+    sep = "\t",
+    quote = F,
+    col.names = T,
+    row.names= F
+  )
+}
+names(tot.ftest.list) <- colnames(contr.matrix)
+```
+
+# batch correct for experimental batch and write out
+```{r}
+# add batch to sample info
+tot.dge.counts$samples$batch <- c(rep("B2", 4), rep(c("B1", "B3", "B3"), 4))
+
+# get log cpms for batch correction
+tot.dge.cpm.log <- cpm(tot.dge.counts, normalized.lib.sizes = TRUE, log = TRUE)
+
+tot.batch.cor.counts.norm <- removeBatchEffect(
+	tot.dge.cpm.log, 
+	batch = tot.dge.counts$sample$batch
+	)
+
+# write out batch corrected normalised counts
+write.table(
+  tot.batch.cor.counts.norm,
+  file.path(res.dir, "Total_batchcorrected_TMMnorm_counts.txt"),
+  sep = "\t",
+  col.names = NA,
+  row.names = TRUE,
+  quote = FALSE
+)
+```
+
+# now get mean ND counts for each gene group
+```{r}
+# get ND samples only
+nd.tot.counts <- as.data.frame(tot.batch.cor.counts.norm[, grepl("ND", colnames(tot.batch.cor.counts.norm))])
+
+# add symbols
+nd.tot.counts$ensg <- rownames(nd.tot.counts)
+nd.tot.counts <- merge(nd.tot.counts, bm.ann, by.x = "ensg", by.y = "ensembl_gene_id")
+# get the mean across the replicates
+nd.tot.counts$rep.mean <- rowMeans(nd.tot.counts[, 2:5])
+
+react.nd.counts <- nd.tot.counts[which(nd.tot.counts$hgnc_symbol %in% react.genes), ]
+non.react.nd.counts <- nd.tot.counts[which(nd.tot.counts$hgnc_symbol %in% non.react.genes), ]
+
+# make density plots of expression for all 3 groups
+nd.exp <- data.frame(
+  "expression" = c(react.nd.counts$rep.mean, non.react.nd.counts$rep.mean, nd.tot.counts$rep.mean),
+  "geneset" = c(rep("reactivated", nrow(react.nd.counts)), rep("non-reactivated", nrow(non.react.nd.counts)), rep("all_genes", nrow(nd.tot.counts)))
+  )
+
+pdf(file.path(plots.dir, "density_ND_Total_expression.pdf"))
+ggplot(nd.exp, aes(x = expression, group = geneset, fill = geneset)) +
+  geom_density(alpha = 0.4) + 
+  ggtitle("Total TTseq ND expression") +
+  theme_minimal()
+dev.off()
+```
+
+# annotate ATAC bed files and check for overlap w/gene lists
+```{r}
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+peak.files <- list.files("/dawson_genomics/Projects/MYC/220902_ATAC/bed_files", pattern = "_peaks.bed", full.names = TRUE)
+
+atac.ann <- list()
+for(peak.i in 1:length(peak.files)){
+  peak.file <- fread(peak.files[peak.i])
+  peak.gr <- with(peak.file, GRanges(V1, IRanges(start = V2, end = V3)))
+	seqlevelsStyle(peak.gr) <- "UCSC"
+	peak.ann <- annotatePeak(peak.gr, TxDb = txdb, annoDb = "org.Hs.eg.db")
+	atac.ann[[peak.i]] <- as.data.frame(peak.ann)
+}
+names(atac.ann) <- gsub("_R1.mLb.clN_peaks.bed", "", basename(peak.files))
+
+# look for atac peaks w/in 500bp of tss of gene lists
+nd.atac.react.genes <- unique(atac.ann$ND$SYMBOL[which(atac.ann$ND$SYMBOL %in% react.genes & abs(atac.ann$ND$distanceToTSS) <= 500)])
+np.atac.react.genes <- unique(atac.ann$NP$SYMBOL[which(atac.ann$NP$SYMBOL %in% react.genes & abs(atac.ann$NP$distanceToTSS) <= 500)])
+dd.atac.react.genes <- unique(atac.ann$dD$SYMBOL[which(atac.ann$dD$SYMBOL %in% react.genes & abs(atac.ann$dD$distanceToTSS) <= 500)])
+dp.atac.react.genes <- unique(atac.ann$dP$SYMBOL[which(atac.ann$dP$SYMBOL %in% react.genes & abs(atac.ann$dP$distanceToTSS) <= 500)])
+
+nd.atac.non.react.genes <- unique(atac.ann$ND$SYMBOL[which(atac.ann$ND$SYMBOL %in% non.react.genes & abs(atac.ann$ND$distanceToTSS) <= 500)])
+np.atac.non.react.genes <- unique(atac.ann$NP$SYMBOL[which(atac.ann$NP$SYMBOL %in% non.react.genes & abs(atac.ann$NP$distanceToTSS) <= 500)])
+dd.atac.non.react.genes <- unique(atac.ann$dD$SYMBOL[which(atac.ann$dD$SYMBOL %in% non.react.genes & abs(atac.ann$dD$distanceToTSS) <= 500)])
+dp.atac.non.react.genes <- unique(atac.ann$dP$SYMBOL[which(atac.ann$dP$SYMBOL %in% non.react.genes & abs(atac.ann$dP$distanceToTSS) <= 500)])
+```
+
+# infer experiment strandedness
+```{bash}
+infer_experiment.py -i Desktop/Projects/MYC/3dD-1-Total_S404.sort.dedup.bam -r Desktop/Projects/MYC/Hg38EnsGeneDT.bed 
+[E::idx_find_and_load] Could not retrieve index file for 'Desktop/Projects/MYC/3dD-1-Total_S404.sort.dedup.bam'
+Reading reference gene model Desktop/Projects/MYC/Hg38EnsGeneDT.bed ... Done
+Loading SAM/BAM file ...  Total 200000 usable reads were sampled
+
+
+This is PairEnd Data
+Fraction of reads failed to determine: 0.0697
+Fraction of reads explained by "1++,1--,2+-,2-+": 0.0340
+Fraction of reads explained by "1+-,1-+,2++,2--": 0.8963
+```
+
+
+# examine termination defect by calculating post TES + 5k reads over last exon reads normalised by exon length: TES->+5000/((last.exon/exon.length)*5000)
+```{r}
+# first make safs for downstream region and last exon to count reads over
+downstream.saf <- data.frame(
+  "GeneID" = react.bed$V4,
+  "Chr" = react.bed$V1,
+  "Start" = react.bed$V3,
+  "End" = react.bed$V3 + 5000,
+  "Strand" = react.bed$V6
+)
+
+last.exon.saf <- NULL
+for(r.gene in 1:nrow(react.bed)){
+  gene.sub <- subset(exon.ann, GeneName == react.bed$V4[r.gene])
+  if(nrow(gene.sub) == 0){next}
+  gene.le.saf <- cbind(
+    react.bed$V4[r.gene],
+    react.bed$V1[r.gene], 
+    gene.sub$Start[which(gene.sub$ExonNumber == max(gene.sub$ExonNumber))], 
+    gene.sub$End[which(gene.sub$ExonNumber == max(gene.sub$ExonNumber))],
+    react.bed$V6[r.gene]
+    )
+  last.exon.saf <- rbind(last.exon.saf, gene.le.saf)
+}
+last.exon.saf <- as.data.frame(last.exon.saf)
+colnames(last.exon.saf) <- c("GeneID","Chr", "Start", "End", "Strand")
+
+# make sure safs have identical genes/rows
+downstream.saf <- downstream.saf[-which(duplicated(downstream.saf)), ]
+last.exon.saf <- last.exon.saf[-which(duplicated(last.exon.saf)), ]
+downstream.saf <- downstream.saf[which(downstream.saf$GeneID %in% last.exon.saf$GeneID), ]
+last.exon.saf <- last.exon.saf[which(last.exon.saf$GeneID %in% downstream.saf$GeneID), ]
+identical(downstream.saf$GeneID, last.exon.saf$GeneID)
+
+downstream.counts <- featureCounts(
+  bam.files,
+  annot.ext = downstream.saf,
+  allowMultiOverlap = FALSE,
+  largestOverlap = TRUE, 
+  isPairedEnd = TRUE, 
+  requireBothEndsMapped = TRUE,
+  countChimericFragments = FALSE,
+  strandSpecific = 2
+)
+colnames(downstream.counts$counts) <- gsub(".sort.dedup.bam", "", colnames(downstream.counts$counts))
+
+last.exon.counts <- featureCounts(
+  bam.files,
+  annot.ext = last.exon.saf,
+  allowMultiOverlap = FALSE,
+  largestOverlap = TRUE, 
+  isPairedEnd = TRUE, 
+  requireBothEndsMapped = TRUE,
+  countChimericFragments = FALSE,
+  strandSpecific = 2
+)
+colnames(last.exon.counts$counts) <- gsub(".sort.dedup.bam", "", colnames(last.exon.counts$counts))
+
+# normalise with TMM, batch corrected for all reads
+downstream.norm <- as.matrix(downstream.counts$counts) %*% diag(dge.counts$samples$lib.size/1000000)
+colnames(downstream.norm) <- colnames(downstream.counts$counts)
+
+last.exon.norm <- as.matrix(last.exon.counts$counts) %*% diag(dge.counts$samples$lib.size/1000000)
+colnames(last.exon.norm) <- colnames(last.exon.counts$counts)
+
+# get mean across replicates
+downstream.mean <- data.frame(
+  "dD_LATE" = rowMeans(downstream.norm[, grepl("dD", colnames(downstream.norm))]), 
+  "dP_LATE" = rowMeans(downstream.norm[, grepl("dP", colnames(downstream.norm))]), 
+  "ND_LATE" = rowMeans(downstream.norm[, grepl("ND", colnames(downstream.norm))]),
+  "NP_LATE" = rowMeans(downstream.norm[, grepl("NP", colnames(downstream.norm))])
+  )
+
+last.exon.mean <- data.frame(
+  "dD_LATE" = rowMeans(last.exon.norm[, grepl("dD", colnames(last.exon.norm))]), 
+  "dP_LATE" = rowMeans(last.exon.norm[, grepl("dP", colnames(last.exon.norm))]), 
+  "ND_LATE" = rowMeans(last.exon.norm[, grepl("ND", colnames(last.exon.norm))]),
+  "NP_LATE" = rowMeans(last.exon.norm[, grepl("NP", colnames(last.exon.norm))])
+  )
+
+# calculate rt score per condition
+last.exon.length <- as.numeric(last.exon.saf$End) - as.numeric(last.exon.saf$Start)
+# first get last exon reads per base to make calculations clearer
+last.exon.rpb <- t(t(last.exon.mean) / last.exon.length)
+rt.score <- downstream.mean / ((last.exon.rpb) * 5000)
+```
+
+# same over non.react genes
+```{r}
+# first make safs for downstream region and last exon to count reads over
+nr.downstream.saf <- data.frame(
+  "GeneID" = non.react.bed$V4,
+  "Chr" = non.react.bed$V1,
+  "Start" = non.react.bed$V3,
+  "End" = non.react.bed$V3 + 5000,
+  "Strand" = non.react.bed$V6
+)
+
+nr.last.exon.saf <- NULL
+for(nr.gene in 1:nrow(non.react.bed)){
+  gene.sub <- subset(exon.ann, GeneName == non.react.bed$V4[nr.gene])
+  if(nrow(gene.sub) == 0){next}
+  gene.le.saf <- cbind(
+    non.react.bed$V4[nr.gene],
+    non.react.bed$V1[nr.gene], 
+    gene.sub$Start[which(gene.sub$ExonNumber == max(gene.sub$ExonNumber))], 
+    gene.sub$End[which(gene.sub$ExonNumber == max(gene.sub$ExonNumber))],
+    non.react.bed$V6[nr.gene]
+    )
+  nr.last.exon.saf <- rbind(nr.last.exon.saf, gene.le.saf)
+}
+nr.last.exon.saf <- as.data.frame(nr.last.exon.saf)
+colnames(nr.last.exon.saf) <- c("GeneID","Chr", "Start", "End", "Strand")
+
+# make sure safs have identical genes/rows
+nr.downstream.saf <- nr.downstream.saf[-which(duplicated(nr.downstream.saf)), ]
+nr.last.exon.saf <- nr.last.exon.saf[-which(duplicated(nr.last.exon.saf)), ]
+nr.downstream.saf <- nr.downstream.saf[which(nr.downstream.saf$GeneID %in% nr.last.exon.saf$GeneID), ]
+nr.last.exon.saf <- nr.last.exon.saf[which(nr.last.exon.saf$GeneID %in% nr.downstream.saf$GeneID), ]
+identical(nr.downstream.saf$GeneID, nr.last.exon.saf$GeneID)
+
+nr.downstream.counts <- featureCounts(
+  bam.files,
+  annot.ext = nr.downstream.saf,
+  allowMultiOverlap = FALSE,
+  largestOverlap = TRUE, 
+  isPairedEnd = TRUE, 
+  requireBothEndsMapped = TRUE,
+  countChimericFragments = FALSE,
+  strandSpecific = 2
+)
+colnames(nr.downstream.counts$counts) <- gsub(".sort.dedup.bam", "", colnames(nr.downstream.counts$counts))
+
+nr.last.exon.counts <- featureCounts(
+  bam.files,
+  annot.ext = nr.last.exon.saf,
+  allowMultiOverlap = FALSE,
+  largestOverlap = TRUE, 
+  isPairedEnd = TRUE, 
+  requireBothEndsMapped = TRUE,
+  countChimericFragments = FALSE,
+  strandSpecific = 2
+)
+colnames(nr.last.exon.counts$counts) <- gsub(".sort.dedup.bam", "", colnames(nr.last.exon.counts$counts))
+
+# normalise with TMM, batch corrected for all reads
+nr.downstream.norm <- as.matrix(nr.downstream.counts$counts) %*% diag(dge.counts$samples$lib.size/1000000)
+colnames(nr.downstream.norm) <- colnames(nr.downstream.counts$counts)
+
+nr.last.exon.norm <- as.matrix(nr.last.exon.counts$counts) %*% diag(dge.counts$samples$lib.size/1000000)
+colnames(nr.last.exon.norm) <- colnames(nr.last.exon.counts$counts)
+
+# get mean across replicates
+nr.downstream.mean <- data.frame(
+  "dD_LATE" = rowMeans(nr.downstream.norm[, grepl("dD", colnames(nr.downstream.norm))]), 
+  "dP_LATE" = rowMeans(nr.downstream.norm[, grepl("dP", colnames(nr.downstream.norm))]), 
+  "ND_LATE" = rowMeans(nr.downstream.norm[, grepl("ND", colnames(nr.downstream.norm))]),
+  "NP_LATE" = rowMeans(nr.downstream.norm[, grepl("NP", colnames(nr.downstream.norm))])
+  )
+
+nr.last.exon.mean <- data.frame(
+  "dD_LATE" = rowMeans(nr.last.exon.norm[, grepl("dD", colnames(nr.last.exon.norm))]), 
+  "dP_LATE" = rowMeans(nr.last.exon.norm[, grepl("dP", colnames(nr.last.exon.norm))]), 
+  "ND_LATE" = rowMeans(nr.last.exon.norm[, grepl("ND", colnames(nr.last.exon.norm))]),
+  "NP_LATE" = rowMeans(nr.last.exon.norm[, grepl("NP", colnames(nr.last.exon.norm))])
+  )
+
+# calculate rt score per condition
+nr.last.exon.length <- as.numeric(nr.last.exon.saf$End) - as.numeric(nr.last.exon.saf$Start)
+# first get last exon reads per base to make calculations clearer
+nr.last.exon.rpb <- t(t(nr.last.exon.mean) / nr.last.exon.length)
+nr.rt.score <- nr.downstream.mean / ((nr.last.exon.rpb) * 5000)
+```
+
+# make heatmaps of rt.scores
+```{r}
+# needs to be a matrix and log transform for readability
+rt.score.mat <- as.matrix(log10(rt.score))
+rt.score.mat[is.infinite(rt.score.mat)] <- 0
+
+col_fun = colorRamp2(seq(-4, 4, length = 9), col = rev(heat.colors(9)))
+
+pdf(file.path(plots.dir, "Heatmap_TTseq_reactGenes_readthroughScore.pdf"))
+Heatmap(rt.score.mat, name = "log10(RT score)", col = col_fun, column_title = "TTseq reactivated genes readthrough", row_names_gp = gpar(fontsize = 2), cluster_columns = FALSE)
+dev.off()
+
+nr.rt.score.mat <- as.matrix(log10(nr.rt.score))
+nr.rt.score.mat[is.infinite(nr.rt.score.mat)] <- 0
+
+pdf(file.path(plots.dir, "Heatmap_TTseq_nonreactGenes_readthroughScore.pdf"))
+Heatmap(nr.rt.score.mat, name = "log10(RT score)", col = col_fun, column_title = "TTseq non-reactivated genes readthrough", row_names_gp = gpar(fontsize = 2), cluster_columns = FALSE)
+dev.off()
+```
+
+# save raw readthrough scores
+```{r}
+write.table(
+  rt.score,
+  file.path(res.dir, "TTseq_reactGenes_readthroughScores.txt"),
+  sep = "\t",
+  col.names = NA,
+  row.names = TRUE,
+  quote = FALSE
+)
+
+write.table(
+  nr.rt.score,
+  file.path(res.dir, "TTseq_nonreactGenes_readthroughScores.txt"),
+  sep = "\t",
+  col.names = NA,
+  row.names = TRUE,
+  quote = FALSE
+)
+```
+
+# check readthrough upstream of TSS for gene lists to see if readthrough could be bleeding into the gene
+```{r}
+# cheack reads 1k upstream and first 1k of gene body for comparison
+upstream.saf <- data.frame(
+  "GeneID" = react.bed$V4,
+  "Chr" = react.bed$V1,
+  "Start" = react.bed$V2 - 5000,
+  "End" = react.bed$V2,
+  "Strand" = react.bed$V6
+)
+
+first.exon.saf <- NULL
+for(r.gene in 1:nrow(react.bed)){
+  gene.sub <- subset(exon.ann, GeneName == react.bed$V4[r.gene])
+  if(nrow(gene.sub) == 0){next}
+  gene.fe.saf <- cbind(
+    react.bed$V4[r.gene],
+    react.bed$V1[r.gene], 
+    gene.sub$Start[which(gene.sub$ExonNumber == min(gene.sub$ExonNumber))], 
+    gene.sub$End[which(gene.sub$ExonNumber == min(gene.sub$ExonNumber))],
+    react.bed$V6[r.gene]
+    )
+  first.exon.saf <- rbind(first.exon.saf, gene.fe.saf)
+}
+first.exon.saf <- as.data.frame(first.exon.saf)
+colnames(first.exon.saf) <- c("GeneID","Chr", "Start", "End", "Strand")
+
+# make sure safs have identical genes/rows
+upstream.saf <- upstream.saf[-which(duplicated(upstream.saf$GeneID)), ]
+first.exon.saf <- first.exon.saf[-which(duplicated(first.exon.saf$GeneID)), ]
+upstream.saf <- upstream.saf[which(upstream.saf$GeneID %in% first.exon.saf$GeneID), ]
+first.exon.saf <- first.exon.saf[which(first.exon.saf$GeneID %in% upstream.saf$GeneID), ]
+identical(upstream.saf$GeneID, first.exon.saf$GeneID)
+
+upstream.counts <- featureCounts(
+  bam.files,
+  annot.ext = upstream.saf,
+  allowMultiOverlap = FALSE,
+  largestOverlap = TRUE, 
+  isPairedEnd = TRUE, 
+  requireBothEndsMapped = TRUE,
+  countChimericFragments = FALSE,
+  strandSpecific = 2
+)
+colnames(upstream.counts$counts) <- gsub(".sort.dedup.bam", "", colnames(upstream.counts$counts))
+
+first.exon.counts <- featureCounts(
+  bam.files,
+  annot.ext = first.exon.saf,
+  allowMultiOverlap = FALSE,
+  largestOverlap = TRUE, 
+  isPairedEnd = TRUE, 
+  requireBothEndsMapped = TRUE,
+  countChimericFragments = FALSE,
+  strandSpecific = 2
+)
+colnames(first.exon.counts$counts) <- gsub(".sort.dedup.bam", "", colnames(first.exon.counts$counts))
+
+# normalise with TMM, batch corrected for all reads
+upstream.norm <- as.matrix(upstream.counts$counts) %*% diag(dge.counts$samples$lib.size/1000000)
+colnames(upstream.norm) <- colnames(upstream.counts$counts)
+
+first.exon.norm <- as.matrix(first.exon.counts$counts) %*% diag(dge.counts$samples$lib.size/1000000)
+colnames(first.exon.norm) <- colnames(first.exon.counts$counts)
+
+# get mean across replicates
+upstream.mean <- data.frame(
+  "dD_LATE" = rowMeans(upstream.norm[, grepl("dD", colnames(upstream.norm))]), 
+  "dP_LATE" = rowMeans(upstream.norm[, grepl("dP", colnames(upstream.norm))]), 
+  "ND_LATE" = rowMeans(upstream.norm[, grepl("ND", colnames(upstream.norm))]),
+  "NP_LATE" = rowMeans(upstream.norm[, grepl("NP", colnames(upstream.norm))])
+  )
+
+first.exon.mean <- data.frame(
+  "dD_LATE" = rowMeans(first.exon.norm[, grepl("dD", colnames(first.exon.norm))]), 
+  "dP_LATE" = rowMeans(first.exon.norm[, grepl("dP", colnames(first.exon.norm))]), 
+  "ND_LATE" = rowMeans(first.exon.norm[, grepl("ND", colnames(first.exon.norm))]),
+  "NP_LATE" = rowMeans(first.exon.norm[, grepl("NP", colnames(first.exon.norm))])
+  )
+
+# calculate rt score per condition
+first.exon.length <- as.numeric(first.exon.saf$End) - as.numeric(first.exon.saf$Start)
+# first get last exon reads per base to make calculations clearer
+first.exon.rpb <- t(t(first.exon.mean) / first.exon.length)
+up.rt.score <- upstream.mean / ((first.exon.rpb) * 5000)
+```
+
+# plot intron number as violin+boxplot
+```{r}
+pdf(file.path(plots.dir, "violinBoxplot_intronNumber_3sets.pdf"))
+ggplot(intron.num, aes(x = geneset, y = length, fill = geneset)) +
+  geom_violin(width = 1.4) +
+  geom_boxplot(width = 0.1, color = "grey", alpha = 0.2) +
+#  scale_fill_viridis(discrete = TRUE) +
+  ggtitle("Number of introns in MANE transcripts") +
+  ylim(0, 30) +
+  theme_minimal()
+dev.off()
+```
+
+# promoter motif enrichment in reactivated genes with homer
+# first write out reactivated genelist
+```{r}
+write.table(
+  react.genes,
+  file.path(res.dir, "reactivated_genelist.txt"),
+  sep = "\n",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# submit homer job
+```{bash}
+sbatch scripts/homer.sbatch
+```
+
+# make heatmap on CGIs w/active promoters as in PROseq
+```{bash}
+sbatch scripts/DTMat_refPoint_CGIprom_merged.sbatch
+```
+
+# subset counts by reactivated genes and write out to send to Jesse
+```{r}
+react.counts <- as.data.frame(batch.cor.counts.norm)
+react.counts$ENSG <- rownames(react.counts)
+react.counts <- merge(react.counts, react.bed, by.x = "ENSG", by.y = "V5")
+colnames(react.counts)[18:22] <- c("Chr", "Start", "End", "HGNC", "Strand")
+
+write.table(
+  react.counts,
+  file.path(res.dir, "Nascent_batchcorrected_TMMnorm_counts_reactGenes.txt"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+
+tot.react.counts <- as.data.frame(tot.batch.cor.counts.norm)
+tot.react.counts$ENSG <- rownames(tot.react.counts)
+tot.react.counts <- merge(tot.react.counts, react.bed, by.x = "ENSG", by.y = "V5")
+colnames(tot.react.counts)[18:22] <- c("Chr", "Start", "End", "HGNC", "Strand")
+
+write.table(
+  tot.react.counts,
+  file.path(res.dir, "Total_batchcorrected_TMMnorm_counts_reactGenes.txt"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# make mane bed for use with heatmaps
+```{r}
+mane.gene <- flattenGTF(
+    "/data/reference/dawson_labs/genomes/Hg38/Homo_sapiens.GRCh38.102.gtf",
+    GTF.featureType = "gene",
+    GTF.attrType = "gene_name",
+    method = "merge"
+    )
+mane.biot <- flattenGTF(
+    "/data/reference/dawson_labs/genomes/Hg38/Homo_sapiens.GRCh38.102.gtf",
+    GTF.featureType = "gene",
+    GTF.attrType = "gene_biotype",
+    method = "merge"
+    )
+
+mane.gene.biot <- merge(mane.gene, mane.biot, by = c("Chr", "Start", "End", "Strand"))
+mane.pc <- subset(mane.gene.biot, GeneID.y == "protein_coding")
+mane.pc <- mane.pc[, c(1:3, 5:6, 4)]
+
+write.table(
+  mane.pc,
+  "/data/reference/dawson_labs/bed_files/Hg38/Hg38_MANE_ProteinCoding.bed",
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# make new DT plots
+```{bash}
+sbatch scripts/DTMat_GeneRegion_pcGenes_dPmedSort_merged.sbatch
+```
+
+# run calculate PSI script
+```{bash}
+#### from home dir
+module load bedtools/2.21
+module load gcc/8.2.0
+module load bowtie2/2.2.9
+module load tophat2/2.1.1
+module load R/4.0.2
+module load samtools/1.3.1
+dname=/dawson_genomics/Projects/MYC/230420_TTseq
+
+./get-psi-byIndi-github.sh -e G -g MYC -b ${dname}/scripts/dDvND_bamlist.txt -c -f /data/reference/dawson_labs/genomes/GRCh38/GCA_000001405.15_GRCh38_full_analysis_set.refseq_annotation.gtf -m temp -n /data/reference/dawson_labs/genomes/Hg38/Homo_sapiens.GRCh38.dna.toplevel.fa -o MYC_dDvND_PSI -p -r 150
+```
+
+# get % spliced as in nanopore
+```{bash}
+# get spliced and unspliced reads for each nascent sample
+module load samtools/1.3.1
+
+samtools view bams/3ND-1-Nascent_S417.sort.dedup.bam  |  awk '($6 ~ /N/)' | cut -f1 | wc -l
+2795906
+samtools flagstat bams/3ND-1-Nascent_S417.sort.dedup.bam
+144723569
+> 2795906/144723569
+[1] 0.01931894
+
+samtools view bams/5ND-1-Nascent_S400.sort.dedup.bam  |  awk '($6 ~ /N/)' | cut -f1 | wc -l
+3045604
+samtools flagstat bams/5ND-1-Nascent_S400.sort.dedup.bam
+135918786
+> 3045604/135918786
+[1] 0.02240753
+
+samtools view bams/5ND-2-Nascent_S421.sort.dedup.bam  |  awk '($6 ~ /N/)' | cut -f1 | wc -l
+3014594
+samtools flagstat bams/5ND-2-Nascent_S421.sort.dedup.bam 
+189853670
+> 3014594/189853670
+[1] 0.01587851
+
+samtools view bams/5ND-3-Nascent_S393.sort.dedup.bam  |  awk '($6 ~ /N/)' | cut -f1 | wc -l
+1230811
+samtools flagstat bams/5ND-3-Nascent_S393.sort.dedup.bam 
+77098791
+> 1230811/77098791
+[1] 0.01596408
+
+samtools view bams/3NP-1-Nascent_S418.sort.dedup.bam  |  awk '($6 ~ /N/)' | cut -f1 | wc -l
+2191653
+samtools flagstat bams/3NP-1-Nascent_S418.sort.dedup.bam
+134490788
+> 2191653/134490788
+[1] 0.01629593
+
+samtools view bams/5NP-1-Nascent_S411.sort.dedup.bam |  awk '($6 ~ /N/)' | cut -f1 | wc -l
+1127914
+samtools flagstat bams/5NP-1-Nascent_S411.sort.dedup.bam
+71083863
+> 1127914/71083863
+[1] 0.01586737
+
+samtools view bams/5NP-2-Nascent_S390.sort.dedup.bam |  awk '($6 ~ /N/)' | cut -f1 | wc -l
+1135345
+samtools flagstat bams/5NP-2-Nascent_S390.sort.dedup.bam
+83623871
+> 1135345/83623871
+[1] 0.01357681
+
+samtools view bams/5NP-3-Nascent_S394.sort.dedup.bam |  awk '($6 ~ /N/)' | cut -f1 | wc -l
+1543576
+samtools flagstat bams/5NP-3-Nascent_S394.sort.dedup.bam
+121551205
+> 1543576/121551205
+[1] 0.01269898
+
+samtools view bams/3dD-1-Nascent_S419.sort.dedup.bam |  awk '($6 ~ /N/)' | cut -f1 | wc -l
+427179
+samtools flagstat bams/3dD-1-Nascent_S419.sort.dedup.bam 
+80111530
+> 427179/80111530
+[1] 0.005332304
+
+samtools view bams/5dD-1-Nascent_S415.sort.dedup.bam |  awk '($6 ~ /N/)' | cut -f1 | wc -l
+335498
+samtools flagstat bams/5dD-1-Nascent_S415.sort.dedup.bam
+71572191
+> 335498/71572191
+[1] 0.004687547
+
+samtools view bams/5dD-2-Nascent_S391.sort.dedup.bam |  awk '($6 ~ /N/)' | cut -f1 | wc -l
+411616
+samtools flagstat bams/5dD-2-Nascent_S391.sort.dedup.bam
+67533180
+> 411616/67533180
+[1] 0.006095019
+
+samtools view bams/5dD-3-Nascent_S395.sort.dedup.bam |  awk '($6 ~ /N/)' | cut -f1 | wc -l
+305319
+samtools flagstat bams/5dD-3-Nascent_S395.sort.dedup.bam
+78627218
+305319/78627218
+[1] 0.003883121
+
+samtools view bams/3dP-1-Nascent_S420.sort.dedup.bam |  awk '($6 ~ /N/)' | cut -f1 | wc -l
+1009145
+samtools flagstat bams/3dP-1-Nascent_S420.sort.dedup.bam 
+163048218
+> 1009145/163048218
+[1] 0.006189243
+
+samtools view bams/5dP-1-Nascent_S416.sort.dedup.bam |  awk '($6 ~ /N/)' | cut -f1 | wc -l
+310687
+samtools flagstat bams/5dP-1-Nascent_S416.sort.dedup.bam
+74614583
+> 310687/74614583
+[1] 0.004163891
+
+samtools view bams/5dP-2-Nascent_S392.sort.dedup.bam |  awk '($6 ~ /N/)' | cut -f1 | wc -l
+329663
+samtools flagstat bams/5dP-2-Nascent_S392.sort.dedup.bam
+77802573
+> 329663/77802573
+[1] 0.004237173
+
+samtools view bams/5dP-3-Nascent_S396.sort.dedup.bam |  awk '($6 ~ /N/)' | cut -f1 | wc -l
+608319
+samtools flagstat bams/5dP-3-Nascent_S396.sort.dedup.bam
+101585741
+> 608319/101585741
+[1] 0.2059593
+```
+
+# make dot plot of percent spliced (spliced reads/unspliced reads)
+```{r}
+dot.data <- data.frame(
+ "spliced" = c(1.93, 2.24, 1.59, 1.60, 1.63, 1.59, 1.36, 1.27, 0.53, 0.47, 0.61, 0.39, 0.62, 0.42, 0.42, 0.60),
+ "group" = factor(c(rep("ND", 4), rep("NP", 4), rep("dD", 4), rep("dP", 4)), levels = c("ND", "NP", "dD", "dP"))
+)
+
+pdf(file.path(plots.dir, "dotplot_percentSpliced.pdf"))
+ggplot(dot.data, aes(x = group, y = spliced, fill = group)) + 
+  geom_dotplot(binaxis = "y", stackdir = "center")+
+  labs(y = "percent spliced", x = "") +
+  theme_classic()
+dev.off()
+```
+
+# use ASpli for splicing analysis
+### too much mem req to run in Rstudio, had to run in R shell (w/96G RAM)
+```{r}
+# init env
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(ASpli)
+project.dir <- "/dawson_genomics/Projects/MYC/230420_TTseq"
+bam.dir <- file.path(project.dir, "bams")
+
+# extract features from txdb
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+features <- binGenome(txdb)
+
+# make targets dataframe
+bam.files <- list.files(bam.dir, pattern = "Nascent_S[0-9][0-9][0-9].sort.dedup.bam$", full.names = TRUE)
+targets <- data.frame(
+  bam = bam.files,
+  tag = sample.ann$tag,
+  treatment = sample.ann$treatment,
+  replicate = sample.ann$replicate,
+  group = sample.ann$group
+)
+
+# summarise read overlaps on all features
+gbcounts <- gbCounts(
+  features = features,
+  targets = targets,
+  minReadLength = 125,
+  maxISize = 30000,
+  libType = "PE",
+  strandMode = 1
+)
+
+# access data in ASpliCounts object
+GeneCounts <- countsg(gbcounts)
+GeneRd <- rdsg(gbcounts)
+BinCounts <- countsb(gbcounts)
+BinRd <- rdsb(gbcounts)
+JunctionCounts <- countsj(gbcounts)
+
+# write outputs
+save.image(file = file.path(project.dir, "Aspli.RData"))
+writeCounts(counts = gbcounts, output.dir = res.dir)
+writeRds(counts = gbcounts, output.dir = res.dir)
+```
+
+# load Aspli.Rdata and get PIR
+```{r}
+load("Aspli.RData")
+
+asd <- jCounts(
+  counts = gbcounts,
+  features = features,
+  minReadLength = 100,
+  libType = "SE",
+  strandMode = 0
+  )
+
+irPIR <- irPIR(asd)
+```
+
+# make a plot of intron retention
+```{r}
+# get average PIR across reps for each condition
+# first replace NaNs w/0s
+irPIR[is.nan(irPIR)] <- 0
+# get mean PIR across reps
+nd.pir <- rowMeans(irPIR[, c(55, 63:65)])
+np.pir <- rowMeans(irPIR[, c(56, 66:68)])
+dd.pir <- rowMeans(irPIR[, c(53, 57:59)])
+dp.pir <- rowMeans(irPIR[, c(54, 60:62)])
+
+# make into long format
+pir.df <- data.frame(
+  "pir" = c(nd.pir, np.pir, dd.pir, dp.pir),
+  "condition" = factor(c(rep("ND", length(nd.pir)), rep("NP", length(np.pir)), rep("dD", length(dd.pir)), rep("dP", length(dp.pir))), levels = c("ND", "NP", "dD", "dP"))
+)
+
+# make violin plot
+pdf(file.path(plots.dir, "violin_proportionIntronRetention.pdf"))
+ggplot(pir.df, aes(x = condition, y = pir, fill = condition)) +
+  geom_violin(width = 1.4) +
+  labs(y = "proportion intron retention", x = "") +
+  theme_minimal()
+dev.off()
+
+# try barplot of mean values
+rep.mean <- data.frame(
+  "PIR" = c(colMeans(irPIR[, 53:68])),
+  "condition" = factor(c("dD","dP", "ND", "NP", rep("dD", 3), rep("dP", 3), rep("ND", 3), rep("NP", 3)), levels = c("ND", "NP", "dD", "dP"))
+)
+
+rep.df <- rep.mean %>%
+  group_by(condition) %>%
+  summarise(mean = mean(PIR), sd = sd(PIR))
+
+pdf(file.path(plots.dir, "barplot_PIR.pdf"))
+ggplot(rep.df, aes(fill = condition, y = mean, x = condition)) + 
+  geom_bar(position = "dodge", stat = "identity", alpha = 0.7) +
+  labs(y = "PIR", x = "") +
+  geom_errorbar(aes(x = condition, ymin = mean - sd, ymax = mean + sd), width = 0.4, colour = c("#F8766D", "#7CAE00", "#00BFC4", "#C77CFF"), size = 1.3) +
+  theme_minimal() 
+dev.off()
+```
+
+# make a violin plot of LFC for DEU in each comparison
+```{r}
+# make LFC df from deu counts
+ddnd.lfc <- log10(rowMeans(res.dxd$countData[, grepl("dD", colnames(res.dxd$countData))]) / rowMeans(res.dxd$countData[, grepl("ND", colnames(res.dxd$countData))]))
+npnd.lfc <- log10(rowMeans(res.dxd$countData[, grepl("NP", colnames(res.dxd$countData))]) / rowMeans(res.dxd$countData[, grepl("ND", colnames(res.dxd$countData))]))
+dpnp.lfc <- log10(rowMeans(res.dxd$countData[, grepl("dP", colnames(res.dxd$countData))]) / rowMeans(res.dxd$countData[, grepl("NP", colnames(res.dxd$countData))]))
+
+deu.lfc <- data.frame(
+  "LFC" = c(dpnp.lfc, ddnd.lfc, npnd.lfc),
+  "comp" = c(rep("dPvNP", length(dpnp.lfc)), rep("dDvND", length(ddnd.lfc)), rep("NPvND", length(npnd.lfc)))
+)
+
+
+pdf(file.path(plots.dir, "violin_DEU_LFC.pdf"))
+ggplot(deu.lfc, aes(x = comp, y = LFC, fill = comp)) +
+  geom_violin(width = 1.4) +
+#  geom_boxplot(width = 0.1, color = "grey", alpha = 0.2) +
+#  scale_fill_viridis(discrete = TRUE) +
+  ggtitle("LFC exon usage") +
+#  ylim(0, 30) +
+  theme_minimal()
+dev.off()
+```
+
+# try rseqqc to make a table of exonic counts
+```{bash}
+module load python/3.11.7-1
+
+for bam in bams/*Nascent.merged.bam
+do
+bname=`basename $bam .merged.bam`
+python3 ~/RSeQC-5.0.1/scripts/read_distribution.py -i $bam -r /data/reference/dawson_labs/bed_files/Hg38/hg38_rseqc_RefSeq_nochr.bed >> results/${bname}_readDistribution.txt
+done
+```
+
+# make barplots with results from rseqc
+```{r}
+# get tags/kb from each rseqc table
+nd.tags <- c(1224.92, 513.66, 537.10, 336.27, 69.74, 45.31, 36.73, 159.13, 115.05, 88.71)
+np.tags <- c(763.17, 293.55, 380.24, 254.14, 47.42, 34.48, 28.67, 120.58, 92.69, 72.86)
+dd.tags <- c(394.14, 208.68, 259.30, 179.78, 34.04, 24.35, 20.74, 123.34, 100.28, 83.77)
+dp.tags <- c(568.53, 274.29, 351.64, 253.85, 48.03, 33.81, 28.58, 166.99, 136.56, 113.46)
+
+# normalise by total tags per mil
+nd.tags <- nd.tags/570888499 * 1000000
+np.tags <- np.tags/427472205 * 1000000
+dd.tags <- dd.tags/307902165 * 1000000
+dp.tags <- dp.tags/429890726 * 1000000
+
+bar.df <- data.frame(
+  "tags.kb" = c(nd.tags, np.tags, dd.tags, dp.tags),
+  "group" = factor(c(rep("ND", 10), rep("NP", 10), rep("dD", 10), rep("dP", 10)), levels = c("ND", "NP", "dD", "dP")),
+  "feature" = factor(rep(c("CDS_Exons", "5'UTR_Exons", "3'UTR_Exons", "Introns", "TSS_up_1kb", "TSS_up_5kb", "TSS_up_10kb", "TES_down_1kb", "TES_down_5kb", "TES_down_10kb"), 4), levels = c("5'UTR_Exons", "3'UTR_Exons", "CDS_Exons", "Introns", "TSS_up_1kb", "TSS_up_5kb", "TSS_up_10kb", "TES_down_1kb", "TES_down_5kb", "TES_down_10kb"))
+)
+
+pdf(file.path(plots.dir, "groupedBarplot_genomicFeatures.pdf"))
+ggplot(bar.df, aes(fill = group, y = tags.kb, x = feature)) + 
+  geom_bar(position = "dodge", stat = "identity") +
+  labs(y = "normalised tags/Kb", x = "") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+dev.off()
+
+pdf(file.path(plots.dir, "stackedBarplot_genomicFeatures.pdf"))
+ggplot(bar.df, aes(fill = feature, y = tags.kb, x = group)) + 
+  geom_bar(position = "stack", stat = "identity") +
+  labs(y = "normalised tags/Kb", x = "") +
+  theme_minimal()
+dev.off()
+
+pdf(file.path(plots.dir, "proportionBarplot_genomicFeatures.pdf"))
+ggplot(bar.df, aes(fill = feature, y = tags.kb, x = group)) + 
+  geom_bar(position = "fill", stat = "identity") +
+  labs(y = "normalised tags/Kb", x = "") +
+  theme_minimal()
+dev.off()
+```
+
+# make a list of expressed genes to use with TR in PolII Chip
+```{r}
+# start with top 50% of expressed genes (TMM & batch cor) avg across all reps
+mean.exp <- rowMeans(tot.batch.cor.counts.norm) 
+mean.exp <- mean.exp[order(mean.exp, decreasing = TRUE)]
+# 16157 genes in mat, so take top 8079
+mean.exp <- mean.exp[1:8079]
+# get gene symbols
+mean.exp.hgnc <- unique(bm.ann$hgnc_symbol[which(bm.ann$ensembl_gene_id %in% names(mean.exp))])
+
+# write top exp genes list
+writeLines(mean.exp.hgnc, file.path(res.dir, "topHalfExpGenes.txt"))
+
+# try top 25% as well 
+mean.exp <- mean.exp[1:4039]
+# get gene symbols
+mean.exp.hgnc <- unique(bm.ann$hgnc_symbol[which(bm.ann$ensembl_gene_id %in% names(mean.exp))])
+
+# write top exp genes list
+writeLines(mean.exp.hgnc, file.path(res.dir, "topQuartExpGenes.txt"))
+
+# try top 10% as well 
+mean.exp <- mean.exp[1:1616]
+# get gene symbols
+mean.exp.hgnc <- unique(bm.ann$hgnc_symbol[which(bm.ann$ensembl_gene_id %in% names(mean.exp))])
+
+# write top exp genes list
+writeLines(mean.exp.hgnc, file.path(res.dir, "topDecExpGenes.txt"))
+```
+
+# also look at PSI with ASpli
+```{r}
+altPSI <- altPSI(asd)
+esPSI <- esPSI(asd)
+
+# make plots as above for PIR
+# first replace NaNs w/0s
+altPSI[is.nan(altPSI)] <- 0
+# get mean PIR across reps
+nd.apsi <- rowMeans(altPSI[, c(55, 63:65)])
+np.apsi <- rowMeans(altPSI[, c(56, 66:68)])
+dd.apsi <- rowMeans(altPSI[, c(53, 57:59)])
+dp.apsi <- rowMeans(altPSI[, c(54, 60:62)])
+
+# make into long format
+apsi.df <- data.frame(
+  "altPSI" = c(nd.apsi, np.apsi, dd.apsi, dp.apsi),
+  "condition" = factor(c(rep("ND", length(nd.apsi)), rep("NP", length(np.apsi)), rep("dD", length(dd.apsi)), rep("dP", length(dp.apsi))), levels = c("ND", "NP", "dD", "dP"))
+)
+
+# make violin plot
+pdf(file.path(plots.dir, "violin_altPSI.pdf"))
+ggplot(apsi.df, aes(x = condition, y = altPSI, fill = condition)) +
+  geom_violin(width = 1.4) +
+  labs(y = "altPSI", x = "") +
+  theme_minimal()
+dev.off()
+
+# get mean per rep and make barplot
+rep.mean <- data.frame(
+  "altPSI" = c(colMeans(altPSI[, 53:68])),
+  "condition" = factor(c("dD","dP", "ND", "NP", rep("dD", 3), rep("dP", 3), rep("ND", 3), rep("NP", 3)), levels = c("ND", "NP", "dD", "dP"))
+)
+
+rep.df <- rep.mean %>%
+  group_by(condition) %>%
+  summarise(mean = mean(altPSI), sd = sd(altPSI))
+
+pdf(file.path(plots.dir, "barplot_altPSI.pdf"))
+ggplot(rep.df, aes(fill = condition, y = mean, x = condition)) + 
+  geom_bar(position = "dodge", stat = "identity", alpha = 0.7) +
+  labs(y = "altPSI", x = "") +
+  geom_errorbar(aes(x = condition, ymin = mean - sd, ymax = mean + sd), width = 0.4, colour = c("#F8766D", "#7CAE00", "#00BFC4", "#C77CFF"), size = 1.3) +
+  theme_minimal() 
+dev.off()
+
+# now for esPSI
+# first replace NaNs w/0s
+esPSI[is.nan(esPSI)] <- 0
+# get mean PIR across reps
+nd.epsi <- rowMeans(esPSI[, c(55, 63:65)])
+np.epsi <- rowMeans(esPSI[, c(56, 66:68)])
+dd.epsi <- rowMeans(esPSI[, c(53, 57:59)])
+dp.epsi <- rowMeans(esPSI[, c(54, 60:62)])
+
+# make into long format
+epsi.df <- data.frame(
+  "esPSI" = c(nd.epsi, np.epsi, dd.epsi, dp.epsi),
+  "condition" = factor(c(rep("ND", length(nd.epsi)), rep("NP", length(np.epsi)), rep("dD", length(dd.epsi)), rep("dP", length(dp.epsi))), levels = c("ND", "NP", "dD", "dP"))
+)
+
+# make violin plot
+pdf(file.path(plots.dir, "violin_esPSI.pdf"))
+ggplot(epsi.df, aes(x = condition, y = esPSI, fill = condition)) +
+  geom_violin(width = 1.4) +
+  labs(y = "esPSI", x = "") +
+  theme_minimal()
+dev.off()
+
+# now barplot 
+rep.mean <- data.frame(
+  "esPSI" = c(colMeans(esPSI[, 53:68])),
+  "condition" = factor(c("dD","dP", "ND", "NP", rep("dD", 3), rep("dP", 3), rep("ND", 3), rep("NP", 3)), levels = c("ND", "NP", "dD", "dP"))
+)
+
+rep.df <- rep.mean %>%
+  group_by(condition) %>%
+  summarise(mean = mean(esPSI), sd = sd(esPSI))
+
+pdf(file.path(plots.dir, "barplot_esPSI.pdf"))
+ggplot(rep.df, aes(fill = condition, y = mean, x = condition)) + 
+  geom_bar(position = "dodge", stat = "identity", alpha = 0.7) +
+  labs(y = "esPSI", x = "") +
+  geom_errorbar(aes(x = condition, ymin = mean - sd, ymax = mean + sd), width = 0.4, colour = c("#F8766D", "#7CAE00", "#00BFC4", "#C77CFF"), size = 1.3) +
+  theme_minimal() 
+dev.off()
+```
+
+# run rMATS using conda env, issues with submitting in an sbatch script (conda shell init error)
+# but it is easy enough to run interactively
+```{bash}
+# run from project dir /dawson_genomics/Projects/MYC/230420_TTseq/
+sinteractive -p prod_short --time 2:00:00 --mem 32G --cpus-per-task 8
+
+# rmats will only run 2 samples at once so dTAG-V and dTAG-NEG samples are run separately
+### need results to go into separate directories as they are all named the same
+module load miniconda3/23.5.2
+conda activate /home/agillespie/rmats_turbo_v4_3_0/conda_envs/test_rmats
+
+# start with dTAG-NEG samples together here 
+~/rmats_turbo_v4_3_0/run_rmats \
+--b1 /dawson_genomics/Projects/MYC/230420_TTseq/scripts/NP_rmats.txt \
+--b2 /dawson_genomics/Projects/MYC/230420_TTseq/scripts/ND_rmats.txt \
+--gtf /data/reference/dawson_labs/genomes/Hg38/Homo_sapiens.GRCh38.102.gtf \
+-t paired --readLength 150 --nthread 8 --od rmats/NP_ND \
+--tmp rmats/NP_ND/temp --novelSS 
+
+# now dTAG samples
+~/rmats_turbo_v4_3_0/run_rmats \
+--b1 /dawson_genomics/Projects/MYC/230420_TTseq/scripts/dP_rmats.txt \
+--b2 /dawson_genomics/Projects/MYC/230420_TTseq/scripts/dD_rmats.txt \
+--gtf /data/reference/dawson_labs/genomes/Hg38/Homo_sapiens.GRCh38.102.gtf \
+-t paired --readLength 150 --nthread 8 --od rmats/dP_dD \
+--tmp rmats/dP_dD/temp --novelSS
+```
+
+# use maser package to plot rmats output
+```{r}
+# set rmats path
+rmats.path <- file.path(project.dir, "rmats")
+
+# make maser obj for each comparison
+dpdd.maser <- maser(file.path(rmats.path, "dP_dD"), c("dP", "dD"), ftype = "JCEC")
+npnd.maser <- maser(file.path(rmats.path, "NP_ND"), c("NP", "ND"), ftype = "JCEC")
+
+# filter low coverage events
+dpdd.maser <- filterByCoverage(dpdd.maser, avg_reads = 5)
+npnd.maser <- filterByCoverage(npnd.maser, avg_reads = 5)
+
+# select only fdr sig and 10% min change in PSI
+dpdd.top.maser <- topEvents(dpdd.maser, fdr = 0.05, deltaPSI = 0.1)
+npnd.top.maser <- topEvents(npnd.maser, fdr = 0.05, deltaPSI = 0.1)
+
+# also make global volcano and dot plots for both comparisons
+pdf(file.path(plots.dir, "volcano_dPvdD_PSI.pdf"))
+volcano(dpdd.maser, fdr = 0.05, deltaPSI = 0.1, type = "SE")
+dev.off()
+
+pdf(file.path(plots.dir, "volcano_NPvND_PSI.pdf"))
+volcano(npnd.maser, fdr = 0.05, deltaPSI = 0.1, type = "SE")
+dev.off()
+
+pdf(file.path(plots.dir, "dotplot_dPvdD_PSI.pdf"))
+dotplot(dpdd.maser, fdr = 0.05, deltaPSI = 0.1, type = "SE")
+dev.off()
+
+pdf(file.path(plots.dir, "dotplot_NPvND_PSI.pdf"))
+dotplot(npnd.maser, fdr = 0.05, deltaPSI = 0.1, type = "SE")
+dev.off()
+```
+
+# also run rmats on dDvND
+```{bash}
+sinteractive -p prod_short --time 2:00:00 --mem 32G --cpus-per-task 8
+
+module load miniconda3/23.5.2
+conda activate /home/agillespie/rmats_turbo_v4_3_0/conda_envs/test_rmats
+
+~/rmats_turbo_v4_3_0/run_rmats \
+--b1 /dawson_genomics/Projects/MYC/230420_TTseq/scripts/dD_rmats.txt \
+--b2 /dawson_genomics/Projects/MYC/230420_TTseq/scripts/ND_rmats.txt \
+--gtf /data/reference/dawson_labs/genomes/Hg38/Homo_sapiens.GRCh38.102.gtf \
+-t paired --readLength 150 --nthread 8 --od rmats/dD_ND \
+--tmp rmats/dD_ND/temp --novelSS 
+```
+
+# make maser plots for these
+```{r}
+# make maser obj for each comparison
+ddnd.maser <- maser(file.path(rmats.path, "dD_ND"), c("dD", "ND"), ftype = "JCEC")
+
+# filter low coverage events
+ddnd.maser <- filterByCoverage(ddnd.maser, avg_reads = 5)
+
+# select only fdr sig and 10% min change in PSI
+ddnd.top.maser <- topEvents(ddnd.maser, fdr = 0.05, deltaPSI = 0.1)
+
+# also make global volcano and dot plots for both comparisons
+pdf(file.path(plots.dir, "volcano_dDvND_PSI.pdf"))
+volcano(ddnd.maser, fdr = 0.05, deltaPSI = 0.1, type = "SE")
+dev.off()
+
+pdf(file.path(plots.dir, "dotplot_dDvND_PSI.pdf"))
+dotplot(ddnd.maser, fdr = 0.05, deltaPSI = 0.1, type = "SE")
+dev.off()
+```
+
+# make a stacked bar event types in each comparison
+```{r}
+rmats.df <- data.frame(
+  "quantity" = c(4871, 3125, 17243, 5337, 2114, 1209, 1115, 5178, 2562, 2562, 3624, 2598, 14793, 4728, 1866),
+  "comparison" = c(rep("NPvND", 5), rep("dPvdD", 5), rep("dDvND", 5)),
+  "event.type" = rep(c("A3SS", "A5SS", "SE", "RI", "MXE"), 3)
+)
+
+pdf(file.path(plots.dir, "stackedBarplot_rMATS_eventTypes.pdf"))
+ggplot(rmats.df, aes(fill = event.type, y = quantity, x = comparison)) + 
+  geom_bar(position = "stack", stat = "identity") +
+  labs(y = "quantity", x = "") +
+  theme_minimal()
+dev.off()
+
+# limit to sig only
+rmats.df <- data.frame(
+  "quantity" = c(55, 56, 302, 240, 48, 13, 6, 25, 23, 10, 364, 371, 1318, 1615, 532),
+  "comparison" = c(rep("NPvND", 5), rep("dPvdD", 5), rep("dDvND", 5)),
+  "event.type" = rep(c("A3SS", "A5SS", "SE", "RI", "MXE"), 3)
+)
+
+pdf(file.path(plots.dir, "stackedBarplot_rMATS_eventTypes_sigOnly.pdf"))
+ggplot(rmats.df, aes(fill = event.type, y = quantity, x = comparison)) + 
+  geom_bar(position = "stack", stat = "identity") +
+  labs(y = "quantity significant", x = "") +
+  theme_minimal()
+dev.off()
+```
+
+# write out tables for each event type in dDvND
+```{r}
+ets <- c("A3SS", "A5SS", "SE", "RI", "MXE")
+
+for(et in ets){
+  et.table <- summary(ddnd.top.maser, type = et)
+  write.table(
+    et.table,
+    file.path(res.dir, paste0(et, "_dDvND_rMATS_resultsTable.txt")),
+    sep = "\t",
+    col.names = TRUE,
+    row.names = FALSE,
+    quote = FALSE
+  )
+}
+```
+
+# get merged scale factors for each
+```{r}
+# get total Dm reads across reps, scale factor for each is 100000000/Dm reads
+sum(dm.counts$samples$lib.size[grepl("*dD-[1-3]-Total*", rownames(dm.counts$samples))])
+[1] 80474263
+100000000/80474263
+[1] 1.242633
+sum(dm.counts$samples$lib.size[grepl("*dP-[1-3]-Total*", rownames(dm.counts$samples))])
+[1] 82814452
+100000000/82814452
+[1] 1.207519
+sum(dm.counts$samples$lib.size[grepl("*ND-[1-3]-Total*", rownames(dm.counts$samples))])
+[1] 96174953
+100000000/96174953
+[1] 1.039772
+sum(dm.counts$samples$lib.size[grepl("*NP-[1-3]-Total*", rownames(dm.counts$samples))])
+[1] 82159606
+100000000/82159606
+[1] 1.217143
+sum(dm.counts$samples$lib.size[grepl("*dD-[1-3]-Nascent*", rownames(dm.counts$samples))])
+[1] 148938696
+100000000/148938696
+[1] 0.6714172
+sum(dm.counts$samples$lib.size[grepl("*dP-[1-3]-Nascent*", rownames(dm.counts$samples))])
+[1] 208543868
+100000000/208543868
+[1] 0.4795154
+sum(dm.counts$samples$lib.size[grepl("*ND-[1-3]-Nascent*", rownames(dm.counts$samples))])
+[1] 273817989
+100000000/273817989
+[1] 0.3652061
+sum(dm.counts$samples$lib.size[grepl("*NP-[1-3]-Nascent*", rownames(dm.counts$samples))])
+[1] 205394821
+100000000/205394821
+[1] 0.4868672
+```
+
+# make merged bams and bigwigs for total fraction as well
+```{bash}
+sbatch scripts/mergeBamCov.sbatch bams/3dD-1-Total_S404.sort.dedup.bam bams/5dD-1-Total_S399.sort.dedup.bam bams/5dD-2-Total_S408.sort.dedup.bam bams/5dD-3-Total_S413.sort.dedup.bam dD-Total 1.242633
+sbatch scripts/mergeBamCov.sbatch bams/3dP-1-Total_S405.sort.dedup.bam bams/5dP-1-Total_S401.sort.dedup.bam bams/5dP-2-Total_S409.sort.dedup.bam bams/5dP-3-Total_S414.sort.dedup.bam dP-Total 1.207519
+sbatch scripts/mergeBamCov.sbatch bams/3ND-1-Total_S402.sort.dedup.bam bams/5ND-1-Total_S397.sort.dedup.bam bams/5ND-2-Total_S406.sort.dedup.bam bams/5ND-3-Total_S410.sort.dedup.bam ND-Total 1.039772
+sbatch scripts/mergeBamCov.sbatch bams/3NP-1-Total_S403.sort.dedup.bam bams/5NP-1-Total_S398.sort.dedup.bam bams/5NP-2-Total_S407.sort.dedup.bam bams/5NP-3-Total_S412.sort.dedup.bam NP-Total 1.217143
+```
+
+# for nascent just running for spikein bigwigs as other files already available
+```{bash}
+sbatch scripts/mergeBamCov.sbatch bams/3dD-1-Nascent_S419.sort.dedup.bam bams/5dD-1-Nascent_S415.sort.dedup.bam bams/5dD-2-Nascent_S391.sort.dedup.bam bams/5dD-3-Nascent_S395.sort.dedup.bam dD-Nascent 0.6714172
+sbatch scripts/mergeBamCov.sbatch bams/3dP-1-Nascent_S420.sort.dedup.bam bams/5dP-1-Nascent_S416.sort.dedup.bam bams/5dP-2-Nascent_S392.sort.dedup.bam bams/5dP-3-Nascent_S396.sort.dedup.bam dP-Nascent 0.4795154
+sbatch scripts/mergeBamCov.sbatch bams/3ND-1-Nascent_S417.sort.dedup.bam bams/5ND-1-Nascent_S400.sort.dedup.bam bams/5ND-2-Nascent_S421.sort.dedup.bam bams/5ND-3-Nascent_S393.sort.dedup.bam ND-Nascent 0.3652061
+sbatch scripts/mergeBamCov.sbatch bams/3NP-1-Nascent_S418.sort.dedup.bam bams/5NP-1-Nascent_S411.sort.dedup.bam bams/5NP-2-Nascent_S390.sort.dedup.bam bams/5NP-3-Nascent_S394.sort.dedup.bam NP-Nascent 0.4868672
+```
+
+# remake all genes plot w/new mane annotation
+```{bash}
+sbatch scripts/DTMat_GeneRegion_allGenes_NDmedSort_merged_Nascent.sbatch
+sbatch scripts/DTMat_GeneRegion_allGenes_NDmedSort_merged_Total.sbatch
+```
+
+# save new reactivated genes list as bed file to use with deeptools in proseq data
+```{r}
+mane.bed <- fread("/dawson_genomics/Projects/MYC/annotations/mane.expressed.prot.coding.genes.hg38.bed")
+
+mane.react.bed <- mane.bed[which(mane.bed$V4 %in% react.genes), ]
+write.table(
+  mane.react.bed,
+  file.path(bed.dir, "mane_reactivated_genes.bed"),
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# make new dt plots with new reactivated list
+```{bash}
+sbatch scripts/DTMat_GeneRegion_reactivated_NDmedSort_merged_Nascent.sbatch
+sbatch scripts/DTMat_GeneRegion_reactivated_NDmedSort_merged_Total.sbatch
+```
+
+# also make new plots w/spike-in norm
+```{bash}
+sbatch scripts/DTMat_GeneRegion_allGenes_NDmedSort_merged_Nascent_spikeinnorm.sbatch
+sbatch scripts/DTMat_GeneRegion_allGenes_NDmedSort_merged_Total_spikeinnorm.sbatch
+sbatch scripts/DTMat_GeneRegion_reactivated_NDmedSort_merged_Nascent_spikeinnorm.sbatch
+sbatch scripts/DTMat_GeneRegion_reactivated_NDmedSort_spikeinnorm_merged_Total.sbatch
+```
+
+# rerun mergeBamCov scripts to also make bin size 50 bws
+```{bash}
+sbatch scripts/mergeBamCov.sbatch bams/3dD-1-Total_S404.sort.dedup.bam bams/5dD-1-Total_S399.sort.dedup.bam bams/5dD-2-Total_S408.sort.dedup.bam bams/5dD-3-Total_S413.sort.dedup.bam dD-Total 1.242633
+sbatch scripts/mergeBamCov.sbatch bams/3dP-1-Total_S405.sort.dedup.bam bams/5dP-1-Total_S401.sort.dedup.bam bams/5dP-2-Total_S409.sort.dedup.bam bams/5dP-3-Total_S414.sort.dedup.bam dP-Total 1.207519
+sbatch scripts/mergeBamCov.sbatch bams/3ND-1-Total_S402.sort.dedup.bam bams/5ND-1-Total_S397.sort.dedup.bam bams/5ND-2-Total_S406.sort.dedup.bam bams/5ND-3-Total_S410.sort.dedup.bam ND-Total 1.039772
+sbatch scripts/mergeBamCov.sbatch bams/3NP-1-Total_S403.sort.dedup.bam bams/5NP-1-Total_S398.sort.dedup.bam bams/5NP-2-Total_S407.sort.dedup.bam bams/5NP-3-Total_S412.sort.dedup.bam NP-Total 1.217143
+
+sbatch scripts/mergeBamCov.sbatch bams/3dD-1-Nascent_S419.sort.dedup.bam bams/5dD-1-Nascent_S415.sort.dedup.bam bams/5dD-2-Nascent_S391.sort.dedup.bam bams/5dD-3-Nascent_S395.sort.dedup.bam dD-Nascent 0.6714172
+sbatch scripts/mergeBamCov.sbatch bams/3dP-1-Nascent_S420.sort.dedup.bam bams/5dP-1-Nascent_S416.sort.dedup.bam bams/5dP-2-Nascent_S392.sort.dedup.bam bams/5dP-3-Nascent_S396.sort.dedup.bam dP-Nascent 0.4795154
+sbatch scripts/mergeBamCov.sbatch bams/3ND-1-Nascent_S417.sort.dedup.bam bams/5ND-1-Nascent_S400.sort.dedup.bam bams/5ND-2-Nascent_S421.sort.dedup.bam bams/5ND-3-Nascent_S393.sort.dedup.bam ND-Nascent 0.3652061
+sbatch scripts/mergeBamCov.sbatch bams/3NP-1-Nascent_S418.sort.dedup.bam bams/5NP-1-Nascent_S411.sort.dedup.bam bams/5NP-2-Nascent_S390.sort.dedup.bam bams/5NP-3-Nascent_S394.sort.dedup.bam NP-Nascent 0.4868672
+```
+
+# remake react genes profile plots w/larger bin size bigwigs & expanded react 
+# genes list (including all, not just expressed genes)
+```{bash}
+sbatch scripts/DTMat_GeneRegion_reactivated_NDmedSort_merged_Nascent_bs50.sbatch
+sbatch scripts/DTMat_GeneRegion_reactivated_NDmedSort_merged_Total_bs50.sbatch
+
+sbatch scripts/DTMat_GeneRegion_reactivated_NDmedSort_merged_Nascent_bs100.sbatch
+sbatch scripts/DTMat_GeneRegion_reactivated_NDmedSort_merged_Total_bs100.sbatch
+```
+
+# elongation velocity analysis
+# get coverage by midpoint of fragments in 50bp bins
+```{bash}
+for bam in bams/*merged.bam
+do
+sbatch scripts/fragMidBamCov.sbatch $bam
+done
+```
+
+# get LFC bigwigs of TTseq/PROseq for each condition
+```{bash}
+sbatch scripts/elongVelocityBWComp.sbatch ND-Nascent.merged.RPGC.bs50.fragMid.bw ND_LATE.merged.RPGC.bw ND
+sbatch scripts/elongVelocityBWComp.sbatch NP-Nascent.merged.RPGC.bs50.fragMid.bw NP_LATE.merged.RPGC.bw NP
+sbatch scripts/elongVelocityBWComp.sbatch dD-Nascent.merged.RPGC.bs50.fragMid.bw dD_LATE.merged.RPGC.bw dD
+sbatch scripts/elongVelocityBWComp.sbatch dP-Nascent.merged.RPGC.bs50.fragMid.bw dP_LATE.merged.RPGC.bw dP
+```
+
+# make heatmaps of TTseq/PROseq bigwigs
+```{bash}
+sbatch scripts/DTMat_RefPoint_MANE_elongVelocity_LFC.sbatch
+sbatch scripts/DTMat_RefPoint_react_elongVelocity_LFC.sbatch
+sbatch scripts/DTMat_RefPoint_nonreact_elongVelocity_LFC.sbatch
+```
+
+# make TSS refpoint LFC plots for comparisons
+```{bash}
+sbatch scripts/DTMat_RefPoint_react_LFC_merged.sbatch
+sbatch scripts/DTMat_RefPoint_nonreact_LFC_merged.sbatch
+sbatch scripts/DTMat_RefPoint_MANE_LFC_merged.sbatch
+```
+
+# also make refpoint plots for expression in each sample
+```{bash}
+sbatch scripts/DTMat_RefPoint_react_merged.sbatch
+sbatch scripts/DTMat_RefPoint_nonreact_merged.sbatch
+sbatch scripts/DTMat_RefPoint_MANE_merged.sbatch
+```
+
+
+# save session info
+```{r}
+sesh.info <- capture.output(sessionInfo())
+writeLines(
+  sesh.info,
+  file.path(project.dir, "session-info", paste0(Sys.Date(), "_TTseq_230420.txt"))
+)
+```
