@@ -1,0 +1,60 @@
+{
+    "Rscriptbin": "/config/binaries/R/4.0.2/bin", 
+    "pythonbin": "/config/binaries/python/3.5.2/bin", 
+    "perlbin": "/config/binaries/perl/5.24.0/bin",
+    "javabin": "/config/binaries/java/1.8.0_171-jdk/bin",
+    "trimmomaticbin": "/config/binaries/trimmomatic/0.39", 
+    "trimmomaticjarfile": "trimmomatic-0.39.jar", 
+    "bowtie2bin": "/config/binaries/bowtie2/2.2.9", 
+    "samtoolsbin": "/config/binaries/samtools/1.9/bin", 
+    "adapterpath": "/dawson_genomics/Projects/JQ1VHL/CutandRun_211014_NB501056_0704_AHNYJVBGXK/cutandruntools/adapters", 
+    "picardbin": "/config/binaries/picard/2.17.3", 
+    "picardjarfile": "picard.jar", 
+    "macs2bin": "/config/binaries/macs/2.2.7.1/bin", 
+    "macs2pythonlib": "/config/binaries/macs/2.2.7.1/lib64/python3.8/site-packages",
+    "kseqbin": "/dawson_genomics/Projects/JQ1VHL/CutandRun_211014_NB501056_0704_AHNYJVBGXK/cutandruntools", 
+    "memebin": "/config/binaries/meme/5.0.5/bin", 
+    "bedopsbin": "/config/binaries/bedops/2.4.35/bin", 
+    "bedtoolsbin": "/config/binaries/bedtools/2.27.1/bin", 
+    "makecutmatrixbin": "/dawson_genomics/Projects/JQ1VHL/CutandRun_211014_NB501056_0704_AHNYJVBGXK/cutandruntools", 
+    "bt2idx": "/data/reference/dawson_labs/joint_genomes/Hg38Sc64/", 
+    "genome_sequence": "/data/reference/dawson_labs/joint_genomes/Hg38Sc64/Hg38Sc64.toplevel.fa", 
+    "extratoolsbin": "/dawson_genomics/Projects/JQ1VHL/CutandRun_211014_NB501056_0704_AHNYJVBGXK/cutandruntools", 
+    "extrasettings": "/dawson_genomics/Projects/JQ1VHL/CutandRun_211014_NB501056_0704_AHNYJVBGXK/cutandruntools", 
+    "input/output": {
+        "fastq_directory": "/dawson_genomics/Projects/MYC/CUTandRUN_220519_NB501056_0802_AH3WTMBGXM/cnrt_wd/fastq", 
+        "workdir": "/dawson_genomics/Projects/MYC/CUTandRUN_220519_NB501056_0802_AH3WTMBGXM/cnrt_wd", 
+        "fastq_sequence_length": 75, 
+        "organism_build": "Hg38Sc64"
+    }, 
+    "motif_finding": {
+        "num_bp_from_summit": 150, 
+        "num_peaks": 1000, 
+        "total_peaks": 5000, 
+        "motif_scanning_pval": 0.0005, 
+        "num_motifs": 10
+    }, 
+    "cluster": {
+        "email": "andrea.gillespie@petermac.org", 
+        "step_alignment": {
+            "queue": "prod_med", 
+            "memory": 24000, 
+            "time_limit": "1-00:00"
+        }, 
+        "step_process_bam": {
+            "queue": "prod_med", 
+            "memory": 24000, 
+            "time_limit": "1-00:00"
+        }, 
+        "step_motif_find": {
+            "queue": "prod_med", 
+            "memory": 8000, 
+            "time_limit": "0-12:00"
+        }, 
+        "step_footprinting": {
+            "queue": "prod_med", 
+            "memory": 8000, 
+            "time_limit": "0-12:00"
+        }
+    }
+}
