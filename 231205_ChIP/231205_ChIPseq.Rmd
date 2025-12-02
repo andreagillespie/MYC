@@ -1,0 +1,241 @@
+---
+title: "ChIPseq_231205"
+author: "Andrea"
+date: "2023/12/13"
+output: html_document
+---
+
+fastq location: /pipeline/Runs/NextSeq/231205_VH01624_48_AACYVNMM5/ProjectFolders/Project_Jesse-Balic/
+project directory: /dawson_genomics/Projects/MYC/2311205_ChIP/
+
+# set up project dir and process (fastqc, trim, align, tdfs)
+```{bash}
+mkdir alignment
+mkdir fastqc
+mkdir trimmed_fastqs
+mkdir logs
+mkdir scripts
+mkdir tdfs
+
+for fq in /pipeline/Runs/NextSeq/231205_VH01624_48_AACYVNMM5/ProjectFolders/Project_Jesse-Balic/Sample*/*_R1_001.fastq.gz
+do
+sbatch scripts/alignHg38.sbatch $fq
+done
+
+module load multiqc/1.8
+multiqc .
+```
+
+# peak calling (both narrow and broad) include bedgraph output for Spark plots and diff peaks if needed
+```{bash}
+mkdir macs/narrowpeaks
+mkdir macs/broadpeaks
+
+for bam in alignment/*dTAG[-_][3AS]*sort.rmdup.bam
+do
+sbatch scripts/macs2.sbatch $bam alignment/R1-EARLY-dTAG-input_S3.sort.rmdup.bam
+done
+
+sbatch scripts/macs2.sbatch alignment/R1-EARLY-A485_S6.sort.rmdup.bam alignment/R1-EARLY-DMSO-input_S2.sort.rmdup.bam
+sbatch scripts/macs2.sbatch alignment/R1-EARLY-DMSO_S4.sort.rmdup.bam alignment/R1-EARLY-DMSO-input_S2.sort.rmdup.bam
+sbatch scripts/macs2.sbatch alignment/R2-EARLY-A485_S10.sort.rmdup.bam alignment/R1-EARLY-DMSO-input_S2.sort.rmdup.bam
+sbatch scripts/macs2.sbatch alignment/R2-EARLY-DMSO_S8.sort.rmdup.bam alignment/R1-EARLY-DMSO-input_S2.sort.rmdup.bam
+```
+
+# make bigwigs for all samples
+```{bash}
+for bam in alignment/*sort.rmdup.bam
+do
+sbatch scripts/DeeptoolsBamCov.sbatch $bam
+done
+```
+
+# make genome wide gene region heatmaps for all
+```{bash}
+sbatch scripts/DTMatrix_P300_allGenes.sbatch
+```
+
+# check for overlap between P300 peaks and superenhancers
+```{bash}
+module load bedtools/2.27.1
+
+for peak in macs/broadpeaks/*broadPeak
+do
+bname=`basename $peak _peaks.broadPeak`
+bedtools intersect -a /dawson_genomics/Projects/MYC/230420_TTseq/bed_files/K562_ENCODE_sedb_01_0039.bed -b $peak -wa -c > bed_files/${bname}_SEcounts.bed
+done
+```
+
+# set up R env
+```{r}
+library(data.table)
+library(Rsubread)
+library(ComplexHeatmap)
+
+project.dir <- file.path("/dawson_genomics/Projects/MYC/231106_ChIP")
+peak.dir <- file.path(project.dir, "macs/broadpeaks")
+bed.dir <- file.path(project.dir, "bed_files")
+res.dir <- file.path(project.dir, "results")
+bam.dir <- file.path(project.dir, "alignment")
+```
+
+# make counts matrix from bed files
+```{r}
+counts.files <- list.files(bed.dir, full.names = TRUE, pattern = "_SEcounts.bed")
+
+se.counts <- fread(counts.files[1])
+for(i in 2:length(counts.files)){
+  cf <- fread(counts.files[i])
+  se.counts <- cbind(se.counts, cf[, 5])
+}
+colnames(se.counts) <- c("chr", "start", "end", "SE", gsub("_SEcounts.bed", "", basename(counts.files)))
+
+write.table(
+  se.counts,
+  file.path(res.dir, "superenhancer_peak_counts.txt"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# number of peaks may not be the best way to look at this, look at reads in SE and make heatmap
+```{r}
+# make saf from super enhancer bed and get counts
+se.bed <- fread("/dawson_genomics/Projects/MYC/230420_TTseq/bed_files/K562_ENCODE_sedb_01_0039.bed")
+se.saf <-data.frame(
+  "GeneID" = se.bed$V4, 
+  "Chr" = se.bed$V1, 
+  "Start" = se.bed$V2, 
+  "End" = se.bed$V3, 
+  "Strand" = "."
+  )
+
+bam.files <- list.files(bam.dir, pattern = "sort.rmdup.bam$", full.names = TRUE)
+
+se.read.counts <- featureCounts(
+  bam.files,
+  annot.ext = se.saf,
+  allowMultiOverlap = FALSE,
+  largestOverlap = TRUE, 
+  isPairedEnd = FALSE
+)
+colnames(se.read.counts$counts) <- gsub(".sort.rmdup.bam", "", colnames(se.read.counts$counts))
+```
+
+# make DT heatmaps centered on super enhancers
+```{bash}
+sbatch scripts/DTMatrix_P300_superEnhancers.sbatch
+```
+
+# convert MACS bedgraphs to bigwigs as in other experiments
+```{bash}
+for bdg in macs/broadpeaks/*_treat_pileup.bdg
+do
+sbatch scripts/bedgraphToBigwig.sbatch $bdg
+done
+```
+
+# make heatmaps with MACS norm bigwigs for all genes and genelists as in previous chip
+```{bash}
+mkdir results
+mkdir plots
+
+sbatch scripts/DTMatrix_P300_superEnhancers_MACSnorm.sbatch
+sbatch scripts/DTMatrix_P300_allGenes_MACSnorm.sbatch
+sbatch scripts/DTMatrix_P300_2genelists_MACSnorm.sbatch
+```
+
+# combine reps and get macs norm bigwigs for further heatmaps
+```{bash}
+module load macs/2.2.7.1
+cd macs/broadpeaks
+
+macs2 cmbreps -i R1-dTAG-3h_S12_treat_pileup.bdg R2-dTAG-3h_S1_treat_pileup.bdg -m mean -o dTAG-3h_treat_pileup.bdg
+macs2 cmbreps -i R1-EARLY-A485_S6_treat_pileup.bdg R2-EARLY-A485_S10_treat_pileup.bdg -m mean -o EARLY-A485_treat_pileup.bdg
+macs2 cmbreps -i R1-EARLY-DMSO_S4_treat_pileup.bdg R2-EARLY-DMSO_S8_treat_pileup.bdg -m mean -o EARLY-DMSO_treat_pileup.bdg
+macs2 cmbreps -i R1-EARLY-dTAG-A485_S7_treat_pileup.bdg R2-EARLY-dTAG-A485_S11_treat_pileup.bdg -m mean -o EARLY-dTAG-A485_treat_pileup.bdg
+macs2 cmbreps -i R1-EARLY-dTAG_S5_treat_pileup.bdg R2-EARLY-dTAG_S9_treat_pileup.bdg -m mean -o EARLY-dTAG_treat_pileup.bdg
+
+macs2 cmbreps -i R1-dTAG-3h_S12_control_lambda.bdg R2-dTAG-3h_S1_control_lambda.bdg -m mean -o dTAG-3h_control_lambda.bdg
+macs2 cmbreps -i R1-EARLY-A485_S6_control_lambda.bdg R2-EARLY-A485_S10_control_lambda.bdg -m mean -o EARLY-A485_control_lambda.bdg
+macs2 cmbreps -i R1-EARLY-DMSO_S4_control_lambda.bdg R2-EARLY-DMSO_S8_control_lambda.bdg -m mean -o EARLY-DMSO_control_lambda.bdg
+macs2 cmbreps -i R1-EARLY-dTAG-A485_S7_control_lambda.bdg R2-EARLY-dTAG-A485_S11_control_lambda.bdg -m mean -o EARLY-dTAG-A485_control_lambda.bdg
+macs2 cmbreps -i R1-EARLY-dTAG_S5_control_lambda.bdg R2-EARLY-dTAG_S9_control_lambda.bdg -m mean -o EARLY-dTAG_control_lambda.bdg
+
+for bdg in macs/broadpeaks/[dE]*bdg
+do
+sbatch scripts/bedgraphToBigwig.sbatch $bdg
+done
+
+# now make heatmap w/new bigwigs
+sbatch scripts/DTMatrix_P300_2genelists_MACSnorm_merged.sbatch
+```
+
+# diffpeak calling, compare dP to all other conditions and get intersect of what is up in dPvOthers
+```{bash}
+dname=macs/broadpeaks
+
+sbatch scripts/bdgdiff.sbatch ${dname}/EARLY-dTAG-A485_treat_pileup.bdg ${dname}/EARLY-dTAG-A485_control_lambda.bdg ${dname}/EARLY-A485_treat_pileup.bdg ${dname}/EARLY-A485_control_lambda.bdg dPvNP
+sbatch scripts/bdgdiff.sbatch ${dname}/EARLY-dTAG-A485_treat_pileup.bdg ${dname}/EARLY-dTAG-A485_control_lambda.bdg ${dname}/EARLY-dTAG_treat_pileup.bdg ${dname}/EARLY-dTAG_control_lambda.bdg dPvdD
+sbatch scripts/bdgdiff.sbatch ${dname}/EARLY-dTAG-A485_treat_pileup.bdg ${dname}/EARLY-dTAG-A485_control_lambda.bdg ${dname}/EARLY-DMSO_treat_pileup.bdg ${dname}/EARLY-DMSO_control_lambda.bdg dPvND
+```
+
+# intersect dP up files from above to get list of p300 peaks induced dual treatment condition
+```{bash}
+# cat files together and sort then merge with counts
+cat bdgdiff/dPvNP_c3.0_cond1.bed bdgdiff/dPvND_c3.0_cond1.bed bdgdiff/dPvdD_c3.0_cond1.bed > bdgdiff/dP_up_all.bed
+
+sort -k1,1 -k2,2n bdgdiff/dP_up_all.bed > bdgdiff/dP_up_all_sorted.bed
+
+module load bedtools/2.27.1
+
+bedtools merge -i bdgdiff/dP_up_all_sorted.bed -c 1 -o count > bdgdiff/dP_up_merged.bed
+```
+
+
+# get merged peaks which occurred in all 3 (dP only) 
+```{r}
+dp.merge <- fread("bdgdiff/dP_up_merged.bed")
+dp.only <- subset(dp.merge, V4 >= 3)
+
+table(dp.merge$V4)
+  1   2   3   4   5 
+384 115  47   2   1 
+# only 50 genome wide, none at MYC
+
+write.table(
+  dp.only,
+  "bdgdiff/dP_only_up.bed",
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# merge bams and get RPGC norm bigwigs
+```{bash}
+sbatch scripts/mergeBamCov.sbatch R1-dTAG-3h_S12.sort.rmdup.bam R2-dTAG-3h_S1.sort.rmdup.bam dTAG-3h
+sbatch scripts/mergeBamCov.sbatch R1-EARLY-A485_S6.sort.rmdup.bam R2-EARLY-A485_S10.sort.rmdup.bam EARLY-A485
+sbatch scripts/mergeBamCov.sbatch R1-EARLY-DMSO_S4.sort.rmdup.bam R2-EARLY-DMSO_S8.sort.rmdup.bam EARLY-DMSO
+sbatch scripts/mergeBamCov.sbatch R1-EARLY-dTAG-A485_S7.sort.rmdup.bam R2-EARLY-dTAG-A485_S11.sort.rmdup.bam EARLY-dTAG-A485
+sbatch scripts/mergeBamCov.sbatch R1-EARLY-dTAG_S5.sort.rmdup.bam R2-EARLY-dTAG_S9.sort.rmdup.bam EARLY-dTAG
+```
+
+# make new heatmaps based on new MANE ann
+```{bash}
+sbatch scripts/DTMatrix_P300_6genelists_RPGCnorm_merged.sbatch
+sbatch scripts/DTMatrix_P300_allGenes_RPGCnorm_merged.sbatch
+```
+
+
+# save session info
+```{r}
+sesh.info <- capture.output(sessionInfo())
+writeLines(
+  sesh.info,
+  file.path(project.dir, "session-info", paste0(Sys.Date(), "_ChIPseq_231106.txt"))
+)
+```
