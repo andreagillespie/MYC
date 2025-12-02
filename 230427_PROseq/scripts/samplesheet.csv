@@ -1,0 +1,13 @@
+sample,fastq_1,fastq_2
+3dD_LATE_R1,comb_fastq/3dD_LATE_R1_S7_comb.fastq.gz,
+3dP_LATE_R1,comb_fastq/3dP_LATE_R1_S8_comb.fastq.gz,
+3ND_LATE_R1,comb_fastq/3ND_LATE_R1_S5_comb.fastq.gz,
+3NP_LATE_R1,comb_fastq/3NP_LATE_R1_S6_comb.fastq.gz,
+5dD_LATE_R1,comb_fastq/5dD_LATE_R1_S3_comb.fastq.gz,
+5dD_LATE_R2,comb_fastq/5dD_LATE_R2_S11_comb.fastq.gz,
+5dP_LATE_R1,comb_fastq/5dP_LATE_R1_S4_comb.fastq.gz,
+5dP_LATE_R2,comb_fastq/5dP_LATE_R2_S12_comb.fastq.gz,
+5ND_LATE_R1,comb_fastq/5ND_LATE_R1_S1_comb.fastq.gz,
+5ND_LATE_R2,comb_fastq/5ND_LATE_R2_S9_comb.fastq.gz,
+5NP_LATE_R1,comb_fastq/5NP_LATE_R1_S2_comb.fastq.gz,
+5NP_LATE_R2,comb_fastq/5NP_LATE_R2_S10_comb.fastq.gz,
