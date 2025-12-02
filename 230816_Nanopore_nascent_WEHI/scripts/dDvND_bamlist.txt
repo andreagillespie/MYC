@@ -1,0 +1,5 @@
+dD_R1	bams_no_supp/dD_R1.filtered.bam	case
+dD_R2	bams_no_supp/dD_R2.filtered.bam	case
+dD_R3	bams_no_supp/dD_R3.filtered.bam	case
+ND_R1	bams_no_supp/ND_R1.filtered.bam	control
+ND_R2	bams_no_supp/ND_R2.filtered.bam	control
