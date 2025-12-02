@@ -1,0 +1,354 @@
+---
+title: "231222_TTseq"
+author: "Andrea"
+date: "2024-01-15"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+fastq dir: /pipeline/Runs/NextSeq/231222_VH01624_56_AACF3V3HV/ProjectFolders/Project_Olivia-Braniff/
+project dir: /dawson_genomics/Projects/MYC/231222_TTseq
+
+# fastqc first
+```{bash}
+mkdir fastqc
+mkdir scripts
+mkdir logs
+mkdir bams
+mkdir tdfs
+mkdir trimmed_fastqs
+
+for fq in /pipeline/Runs/NextSeq/231222_VH01624_56_AACF3V3HV/ProjectFolders/Project_Olivia-Braniff/Sample*/*_R1_001.fastq.gz
+do
+bname=`basename $fq _R1_001.fastq.gz`
+dname=`dirname $fq`
+sbatch scripts/fastqc.sbatch $fq ${dname}/${bname}_R2_001.fastq.gz 
+done
+
+# when fastqc is finished run multiqc 
+module load multiqc/1.8
+cd fastqc
+multiqc .
+cd ..
+```
+
+# run trimming, alignment, counting script
+```{bash}
+for fq in /pipeline/Runs/NextSeq/231222_VH01624_56_AACF3V3HV/ProjectFolders/Project_Olivia-Braniff/Sample*/*_R1_001.fastq.gz
+do
+bname=`basename $fq _R1_001.fastq.gz`
+dname=`dirname $fq`
+sbatch scripts/align_star.sbatch $fq ${dname}/${bname}_R2_001.fastq.gz 
+done
+
+# compile full multiqc
+module load multiqc/1.8
+multiqc .
+```
+
+# Load R libraries
+```{r}
+library(edgeR)
+library(data.table)
+library(RColorBrewer)
+library(qvalue)
+```
+
+# set paths in R
+```{r}
+project.dir <- "/dawson_genomics/Projects/MYC/231222_TTseq"
+counts.dir <- file.path(project.dir, "counts")
+res.dir <- file.path(project.dir, "results")
+plots.dir <- file.path(project.dir, "plots")
+bam.dir <- file.path(project.dir, "bams")
+```
+
+# DE of nascent RNA
+```{r}
+# get a list of all nascent files
+files <- list.files(counts.dir, pattern = "early-[12]")
+
+# make sample annotation 
+sample.ann <- data.frame(
+  "files" = files, 
+  "samples" = gsub(".count", "", basename(files)), 
+  "tag" = c(rep("dTAG-V", 2), rep("dTAG-NEG", 2), rep("dTAG-V", 4), rep("dTAG-NEG", 4)),
+  "treatment" = c(rep(c("DMSO", "P300i"), 2), rep("DMSO", 2), rep("P300i", 2), rep("DMSO", 2), rep("P300i", 2)),
+  "replicate" = c(rep("3_1", 4), rep(c("5_1", "5_2"), 4)),
+  "group" = c("dD", "dP", "ND", "NP", rep("dD", 2), rep("dP", 2), rep("ND", 2), rep("NP", 2))
+  )
+sample.ann
+
+dge.counts = readDGE(
+  file = sample.ann$files, 
+  path = counts.dir,
+  group = sample.ann$group
+  )
+```
+
+# Filtering out genes with low counts & not useful
+```{r}
+noint <- rownames(dge.counts$counts) %in% c("__no_feature", "__ambiguous", "__too_low_aQual", "__not_aligned", "__alignment_not_unique")
+counts.cpms <- cpm(dge.counts$counts)
+# start with minimal filter
+keep <- rowSums(counts.cpms > 1 ) >= 2 & !noint
+dim(dge.counts$counts)
+dge.counts$counts <- dge.counts$counts[keep,]
+dim(dge.counts$counts)
+```
+
+
+# add ann info
+```{r}
+dge.counts$samples$treatment = sample.ann$treatment
+dge.counts$samples$tag = sample.ann$tag
+dge.counts$samples$replicate = sample.ann$replicate
+```
+
+# MDS plot unnorm counts
+```{r}
+# Setting colours
+col.group <- as.factor(dge.counts$samples$group)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+col.group <- as.character(col.group)
+
+pdf(file.path(plots.dir, "MDS_nascent_unnorm_counts.pdf"))
+MDS = plotMDS(
+  dge.counts,
+  labels = paste0(dge.counts$samples$group, "_", dge.counts$samples$replicate), 
+  col = col.group,
+  main = "Nascent unnorm counts"
+  )
+dev.off()
+```
+
+# calc TMM norm and write out file
+```{r}
+dge.counts <- calcNormFactors(dge.counts, method="TMM")
+
+# multiply counts by norm factors
+counts.norm <- dge.counts$counts%*%diag(dge.counts$samples$norm.factors)
+colnames(counts.norm) <- sample.ann$samples
+write.table(
+  counts.norm,
+  file.path(res.dir, "Nascent_TMMnorm_counts.txt"),
+  sep = "\t",
+  col.names = NA,
+  row.names = TRUE,
+  quote = FALSE
+)
+```
+
+# MDS plot norm counts
+```{r}
+pdf(file.path(plots.dir, "MDS_nascent_TMMnorm_counts.pdf"))
+MDS = plotMDS(
+  dge.counts,
+  labels = paste0(dge.counts$samples$group, "_", dge.counts$samples$replicate), 
+  col = col.group,
+  main = "Nascent TMM norm counts"
+  )
+dev.off()
+```
+
+# unnorm MDS shows clustering dependent on clones, could treat as batches, but TMM norm largely clears it up, so proceeding with TMM
+# set design and contrasts for DE
+```{r}
+# design table
+design = model.matrix(~0+group, data = dge.counts$samples)
+colnames(design) <- gsub("group", "", colnames(design))
+design
+
+contr.matrix <- makeContrasts(
+  dPvNP = dP-NP,
+  dDvND = dD-ND,
+  NPvND = NP-ND,
+  levels = colnames(design)
+  )
+contr.matrix
+```
+
+# estimate dispersion and get DE
+```{r}
+dge.counts = estimateDisp(dge.counts, design)
+gfit <- glmQLFit(dge.counts, design)
+
+ftest.list <- list()
+
+# annotate with gene symbols
+bm.ann <- fread("/data/reference/dawson_labs/biomart_annotations/Hsapiens/ensembl_hgnc_entrez.txt")
+
+for(contrast.i in 1:length(colnames(contr.matrix))){
+
+  ftest.list[[contrast.i]] <- glmQLFTest(gfit, contrast = contr.matrix[, contrast.i])
+  ftest.list[[contrast.i]]$table$ensg <- rownames(ftest.list[[contrast.i]]$table)
+  ftest.list[[contrast.i]]$table <- merge(ftest.list[[contrast.i]]$table, bm.ann, by.x = "ensg", by.y = "ensembl_gene_id")
+  # add qvalues to table, order by that and write out
+  qv <- qvalue(ftest.list[[contrast.i]]$table$PValue)
+  ftest.list[[contrast.i]]$table$QValue <- qv$qvalues
+  ftest.list[[contrast.i]]$table <- ftest.list[[contrast.i]]$table[order(ftest.list[[contrast.i]]$table$QValue, decreasing = FALSE),]
+  write.table(
+    ftest.list[[contrast.i]]$table,
+    file.path(res.dir, paste0(colnames(contr.matrix)[contrast.i], "_ftest_table.txt")),
+    sep = "\t",
+    quote = F,
+    col.names = T,
+    row.names= F
+  )
+}
+names(ftest.list) <- colnames(contr.matrix)
+```
+
+# re-defining "reactivating" genes as sig down in NPvND subset for sig up in dPvNP without any sig up in dDvND
+```{r}
+# get sig up genes in each comparison
+npnd.down <- ftest.list$NPvND$table$hgnc_symbol[which(ftest.list$NPvND$table$QValue < 0.05 & ftest.list$NPvND$table$logFC < 0)]
+dpnp.up <- ftest.list$dPvNP$table$hgnc_symbol[which(ftest.list$dPvNP$table$QValue < 0.05 & ftest.list$dPvNP$table$logFC > 0)]
+ddnd.up <- ftest.list$dDvND$table$hgnc_symbol[which(ftest.list$dDvND$table$QValue < 0.05 & ftest.list$dDvND$table$logFC > 0)]
+
+down.sub <- intersect(npnd.down, dpnp.up)
+react.genes <- down.sub[-which(down.sub %in% ddnd.up)]
+```
+
+# save new reactivated genes list as bed file to use with deeptools in proseq data
+```{r}
+bed.dir <- file.path(project.dir, "bed_files")
+
+dt.bed <- fread("/data/reference/dawson_labs/bed_files/Hg38/Hg38EnsGeneStrandPlusMinusWhitelist.bed")
+react.bed <- dt.bed[which(dt.bed$V4 %in% react.genes), ]
+write.table(
+  react.bed,
+  file.path(bed.dir, "early_reactivated_genes.bed"),
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# define non-reactivated as sig down NPvND and sig down dPvNP
+```{r}
+dpnp.down <- ftest.list$dPvNP$table$hgnc_symbol[which(ftest.list$dPvNP$table$QValue < 0.05 & ftest.list$dPvNP$table$logFC < 0)]
+
+non.react.genes <- intersect(npnd.down, dpnp.down)
+
+# make bed of non-reactivated genes and write out
+non.react.bed <- dt.bed[which(dt.bed$V4 %in% non.react.genes), ]
+write.table(
+  non.react.bed,
+  file.path(bed.dir, "early_nonreactivated_genes.bed"),
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# merge bams and make bigwigs for deeptools
+```{bash}
+sbatch scripts/mergeBamCov.sbatch bams/3dD-nascent-early-1_S26.sort.dedup.bam bams/5dD-nascent-early-1_S22.sort.dedup.bam bams/5dD-nascent-early-2_S6.sort.dedup.bam dD-nascent-early
+sbatch scripts/mergeBamCov.sbatch bams/3dP-nascent-early-1_S27.sort.dedup.bam bams/5dP-nascent-early-1_S23.sort.dedup.bam bams/5dP-nascent-early-2_S7.sort.dedup.bam dP-nascent-early
+sbatch scripts/mergeBamCov.sbatch bams/3ND-nascent-early-1_S24.sort.dedup.bam bams/5ND-nascent-early-1_S15.sort.dedup.bam bams/5ND-nascent-early-2_S28.sort.dedup.bam ND-nascent-early
+sbatch scripts/mergeBamCov.sbatch bams/3NP-nascent-early-1_S25.sort.dedup.bam bams/5NP-nascent-early-1_S21.sort.dedup.bam bams/5NP-nascent-early-2_S5.sort.dedup.bam NP-nascent-early
+```
+
+# make heatmaps on reactivated genes list from LATE and EARLY timepoints
+```{bash}
+sbatch scripts/DTMat_GR_reactivated_NDmedSort_merged.sbatch
+sbatch scripts/DTMat_GR_earlyreactivated_NDmedSort_merged.sbatch
+```
+
+# compare late & early react genes list
+```{r}
+late.react <- fread("/dawson_genomics/Projects/MYC/230420_TTseq/bed_files/reactivated_genes.bed")
+intersect(react.genes, late.react$V4)
+
+#npnd.down.both <- ftest.list$NPvND$table[which(ftest.list$NPvND$table$hgnc_symbol %in% late.react$V4 & ftest.list$NPvND$table$QValue < 0.05 & ftest.list$NPvND$table$logFC < 0), ]
+#dpnp.up.both <- ftest.list$dPvNP$table[which(ftest.list$dPvNP$table$hgnc_symbol %in% late.react$V4 & ftest.list$dPvNP$table$QValue < 0.05 & ftest.list$dPvNP$table$logFC > 0), ]
+ddnd.up.both <- ftest.list$dDvND$table[which(ftest.list$dDvND$table$hgnc_symbol %in% late.react$V4 & ftest.list$dDvND$table$QValue < 0.05 & ftest.list$dDvND$table$logFC > 0), ]
+
+early.npnd.fail <- ftest.list$NPvND$table[which(ftest.list$NPvND$table$hgnc_symbol %in% late.react$V4 & (ftest.list$NPvND$table$QValue > 0.05 | ftest.list$NPvND$table$logFC > 0)), ]
+early.dpnp.fail <- ftest.list$dPvNP$table[which(ftest.list$dPvNP$table$hgnc_symbol %in% late.react$V4 & (ftest.list$dPvNP$table$QValue > 0.05 | ftest.list$dPvNP$table$logFC < 0)), ]
+#early.ddnd.fail <- ftest.list$dDvND$table[which(ftest.list$dDvND$table$hgnc_symbol %in% late.react$V4 & (ftest.list$dDvND$table$QValue > 0.05 | ftest.list$dDvND$table$logFC < 0)), ]
+```
+
+# load DM counts into edger for spike in norm calculations
+```{r}
+dm.counts.dir <- file.path(project.dir, "Dm_counts")
+
+dm.files <- list.files(dm.counts.dir)
+dm.counts = readDGE(
+  file = dm.files, 
+  path = dm.counts.dir
+  )
+```
+
+# get spike in norm factors 
+```{r}
+# get total Dm reads across reps, scale factor for each is 100000000/Dm reads
+sum(dm.counts$samples$lib.size[grepl("*dD-nascent-early-total*", rownames(dm.counts$samples))])
+[1] 75112985
+100000000/75112985
+[1] 1.331328
+sum(dm.counts$samples$lib.size[grepl("*dP-nascent-early-total*", rownames(dm.counts$samples))])
+[1] 64986811
+100000000/64986811
+[1] 1.538774
+sum(dm.counts$samples$lib.size[grepl("*ND-nascent-early-total*", rownames(dm.counts$samples))])
+[1] 72127622
+100000000/72127622
+[1] 1.386431
+sum(dm.counts$samples$lib.size[grepl("*NP-nascent-early-total*", rownames(dm.counts$samples))])
+[1] 64385909
+100000000/64385909
+[1] 1.553135
+sum(dm.counts$samples$lib.size[grepl("*dD-nascent-early-[1-3]_S*", rownames(dm.counts$samples))])
+[1] 112211173
+100000000/112211173
+[1] 0.8911769
+sum(dm.counts$samples$lib.size[grepl("*dP-nascent-early-[1-3]_S*", rownames(dm.counts$samples))])
+[1] 99665596
+100000000/99665596
+[1] 1.003355
+sum(dm.counts$samples$lib.size[grepl("*ND-nascent-early-[1-3]_S*", rownames(dm.counts$samples))])
+[1] 115848129
+100000000/115848129
+[1] 0.8631991
+sum(dm.counts$samples$lib.size[grepl("*NP-nascent-early-[1-3]_S*", rownames(dm.counts$samples))])
+[1] 111786401
+100000000/111786401
+[1] 0.8945632
+```
+
+# rerun bam cov to get spike in norm bigwigs
+```{bash}
+sbatch scripts/spikeinBamCov.sbatch dD-nascent-early-total 1.331328
+sbatch scripts/spikeinBamCov.sbatch dP-nascent-early-total 1.538774
+sbatch scripts/spikeinBamCov.sbatch ND-nascent-early-total 1.386431
+sbatch scripts/spikeinBamCov.sbatch NP-nascent-early-total 1.553135
+
+sbatch scripts/spikeinBamCov.sbatch dD-nascent-early 0.8911769
+sbatch scripts/spikeinBamCov.sbatch dP-nascent-early 1.003355
+sbatch scripts/spikeinBamCov.sbatch ND-nascent-early 0.8631991
+sbatch scripts/spikeinBamCov.sbatch NP-nascent-early 0.8945632
+```
+
+# make all genes heatmaps & profile plots w/new MANE annotation
+```{bash}
+sbatch scripts/DTMat_GR_nascent_allGenes_NDmedSort_merged.sbatch
+sbatch scripts/DTMat_GR_total_allGenes_NDmedSort_merged.sbatch
+```
+
+
+# save session info
+```{r}
+sesh.info <- capture.output(sessionInfo())
+writeLines(
+  sesh.info,
+  file.path(project.dir, "session-info", paste0(Sys.Date(), "_TTseq_230420.txt"))
+)
+```
