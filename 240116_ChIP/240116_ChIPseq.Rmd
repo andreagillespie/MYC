@@ -1,0 +1,558 @@
+---
+title: "ChIPseq_240111"
+author: "Andrea"
+date: "2024/01/18"
+output: html_document
+---
+
+fastq location: /pipeline/Runs/NextSeq/240116_VH00665_21_AACG2NNHV/ProjectFolders/Project_Jesse-Balic/
+project directory: /dawson_genomics/Projects/MYC/240116_ChIP/
+
+# set up project dir and process (fastqc, trim, align, tdfs)
+```{bash}
+mkdir alignment
+mkdir fastqc
+mkdir trimmed_fastqs
+mkdir logs
+mkdir scripts
+mkdir tdfs
+
+for fq in /pipeline/Runs/NextSeq/240116_VH00665_21_AACG2NNHV/ProjectFolders/Project_Jesse-Balic/Sample*/*_R1_001.fastq.gz
+do
+sbatch scripts/alignHg38.sbatch $fq
+done
+
+module load multiqc/1.8
+multiqc .
+```
+
+# peak calling (both narrow and broad) include bedgraph output for Spark plots and diff peaks if needed
+```{bash}
+mkdir macs/narrowpeaks
+mkdir macs/broadpeaks
+
+for bam in alignment/R[1-3]-[bnp]*sort.rmdup.bam
+do
+sbatch scripts/macs2.sbatch $bam alignment/R1-input-2_S35.sort.rmdup.bam
+done
+```
+
+# make bigwigs from macs bedgraph output as in other experiments
+```{bash}
+mkdir bigwigs
+
+for bdg in macs/broadpeaks/*_treat_pileup.bdg
+do
+sbatch scripts/bedgraphToBigwig.sbatch $bdg
+done
+```
+
+# make metaplots from macs norm bigwigs for all genes, 2 genesets and ATAC intergenic as in other exps
+```{bash}
+mkdir plots
+mkdir results
+
+sbatch scripts/DTMatrix_pS2_PolII_allGenes_MACSnorm.sbatch
+sbatch scripts/DTMatrix_pS2_PolII_2genelists_MACSnorm.sbatch
+sbatch scripts/DTMatrix_pS2_PolII_dTAG_ATACup_MACSnorm.sbatch
+
+sbatch scripts/DTMatrix_pS5_PolII_allGenes_MACSnorm.sbatch
+sbatch scripts/DTMatrix_pS5_PolII_2genelists_MACSnorm.sbatch
+sbatch scripts/DTMatrix_pS5_PolII_dTAG_ATACup_MACSnorm.sbatch
+```
+
+# combine reps, get bigwigs for comb reps and make new heatmaps
+```{bash}
+sbatch scripts/cmbreps.sbatch R1-bulk-A485-dTAG-pS2-Pol2_S32_treat_pileup.bdg R2-bulk-A485-dTAG-pS2-Pol2_S33_treat_pileup.bdg R3-bulk-A485-dTAG-pS2-Pol2_S34_treat_pileup.bdg bulk-A485-dTAG-pS2-Pol2_treat_pileup.bdg
+sbatch scripts/cmbreps.sbatch R1-bulk-A485-dTAG-pS5-Pol2_S49_treat_pileup.bdg R2-bulk-A485-dTAG-pS5-Pol2_S51_treat_pileup.bdg R3-bulk-A485-dTAG-pS5-Pol2_S52_treat_pileup.bdg bulk-A485-dTAG-pS5-Pol2_treat_pileup.bdg
+sbatch scripts/cmbreps.sbatch R1-bulk-A485-pS2-Pol2_S50_treat_pileup.bdg R2-bulk-A485-pS2-Pol2_S56_treat_pileup.bdg R3-bulk-A485-pS2-Pol2_S29_treat_pileup.bdg bulk-A485-pS2-Pol2_treat_pileup.bdg
+sbatch scripts/cmbreps.sbatch R1-bulk-A485-pS5-Pol2_S37_treat_pileup.bdg R2-bulk-A485-pS2-pS5-Pol2_S42_treat_pileup.bdg R3-bulk-A485-pS2-pS5-Pol2_S46_treat_pileup.bdg bulk-A485-pS5-Pol2_treat_pileup.bdg
+sbatch scripts/cmbreps.sbatch R1-bulk-DMSO-pS2-Pol2_S39_treat_pileup.bdg R2-bulk-DMSO-pS2-Pol2_S55_treat_pileup.bdg R3-bulk-DMSO-pS2-Pol2_S59_treat_pileup.bdg bulk-DMSO-pS2-Pol2_treat_pileup.bdg
+sbatch scripts/cmbreps.sbatch R1-bulk-DMSO-pS5-Pol2_S36_treat_pileup.bdg R2-bulk-DMSO-pS2-pS5-Pol2_S41_treat_pileup.bdg R3-bulk-DMSO-pS2-pS5-Pol2_S45_treat_pileup.bdg bulk-DMSO-pS5-Pol2_treat_pileup.bdg
+sbatch scripts/cmbreps.sbatch R1-neg-reactivation-pS2-Pol2_S53_treat_pileup.bdg R2-neg-reactivation-pS2-Pol2_S57_treat_pileup.bdg R3-neg-reactivation-pS2-Pol2_S30_treat_pileup.bdg neg-reactivation-pS2-Pol2_treat_pileup.bdg
+sbatch scripts/cmbreps.sbatch R1-neg-reactivation-pS5-Pol2_S38_treat_pileup.bdg R2-neg-reactivation-pS5-Pol2_S43_treat_pileup.bdg R3-neg-reactivation-pS5-Pol2_S47_treat_pileup.bdg neg-reactivation-pS5-Pol2_treat_pileup.bdg
+sbatch scripts/cmbreps.sbatch R1-pos-reactivation-pS2-Pol2_S54_treat_pileup.bdg R2-pos-reactivation-pS2-Pol2_S58_treat_pileup.bdg R3-pos-reactivation-pS2-Pol2_S31_treat_pileup.bdg pos-reactivation-pS2-Pol2_treat_pileup.bdg
+sbatch scripts/cmbreps.sbatch R1-pos-reactivation-pS5-Pol2_S40_treat_pileup.bdg R2-pos-reactivation-pS5-Pol2_S44_treat_pileup.bdg R3-pos-reactivation-pS5-Pol2_S48_treat_pileup.bdg pos-reactivation-pS5-Pol2_treat_pileup.bdg
+
+sbatch scripts/cmbreps.sbatch R1-bulk-A485-dTAG-pS2-Pol2_S32_control_lambda.bdg R2-bulk-A485-dTAG-pS2-Pol2_S33_control_lambda.bdg R3-bulk-A485-dTAG-pS2-Pol2_S34_control_lambda.bdg bulk-A485-dTAG-pS2-Pol2_control_lambda.bdg
+sbatch scripts/cmbreps.sbatch R1-bulk-A485-dTAG-pS5-Pol2_S49_control_lambda.bdg R2-bulk-A485-dTAG-pS5-Pol2_S51_control_lambda.bdg R3-bulk-A485-dTAG-pS5-Pol2_S52_control_lambda.bdg bulk-A485-dTAG-pS5-Pol2_control_lambda.bdg
+sbatch scripts/cmbreps.sbatch R1-bulk-A485-pS2-Pol2_S50_control_lambda.bdg R2-bulk-A485-pS2-Pol2_S56_control_lambda.bdg R3-bulk-A485-pS2-Pol2_S29_control_lambda.bdg bulk-A485-pS2-Pol2_control_lambda.bdg
+sbatch scripts/cmbreps.sbatch R1-bulk-A485-pS5-Pol2_S37_control_lambda.bdg R2-bulk-A485-pS2-pS5-Pol2_S42_control_lambda.bdg R3-bulk-A485-pS2-pS5-Pol2_S46_control_lambda.bdg bulk-A485-pS5-Pol2_control_lambda.bdg
+sbatch scripts/cmbreps.sbatch R1-bulk-DMSO-pS2-Pol2_S39_control_lambda.bdg R2-bulk-DMSO-pS2-Pol2_S55_control_lambda.bdg R3-bulk-DMSO-pS2-Pol2_S59_control_lambda.bdg bulk-DMSO-pS2-Pol2_control_lambda.bdg
+sbatch scripts/cmbreps.sbatch R1-bulk-DMSO-pS5-Pol2_S36_control_lambda.bdg R2-bulk-DMSO-pS2-pS5-Pol2_S41_control_lambda.bdg R3-bulk-DMSO-pS2-pS5-Pol2_S45_control_lambda.bdg bulk-DMSO-pS5-Pol2_control_lambda.bdg
+sbatch scripts/cmbreps.sbatch R1-neg-reactivation-pS2-Pol2_S53_control_lambda.bdg R2-neg-reactivation-pS2-Pol2_S57_control_lambda.bdg R3-neg-reactivation-pS2-Pol2_S30_control_lambda.bdg neg-reactivation-pS2-Pol2_control_lambda.bdg
+sbatch scripts/cmbreps.sbatch R1-neg-reactivation-pS5-Pol2_S38_control_lambda.bdg R2-neg-reactivation-pS5-Pol2_S43_control_lambda.bdg R3-neg-reactivation-pS5-Pol2_S47_control_lambda.bdg neg-reactivation-pS5-Pol2_control_lambda.bdg
+sbatch scripts/cmbreps.sbatch R1-pos-reactivation-pS2-Pol2_S54_control_lambda.bdg R2-pos-reactivation-pS2-Pol2_S58_control_lambda.bdg R3-pos-reactivation-pS2-Pol2_S31_control_lambda.bdg pos-reactivation-pS2-Pol2_control_lambda.bdg
+sbatch scripts/cmbreps.sbatch R1-pos-reactivation-pS5-Pol2_S40_control_lambda.bdg R2-pos-reactivation-pS5-Pol2_S44_control_lambda.bdg R3-pos-reactivation-pS5-Pol2_S48_control_lambda.bdg pos-reactivation-pS5-Pol2_control_lambda.bdg
+
+for bdg in macs/broadpeaks/[bnp]*_treat_pileup.bdg
+do
+sbatch scripts/bedgraphToBigwig.sbatch $bdg
+done
+
+sbatch scripts/DTMatrix_PolII_dTAG_ATACup_MACSnorm_merged.sbatch
+sbatch scripts/DTMatrix_PolII_2genelists_MACSnorm_merged.sbatch
+sbatch scripts/DTMatrix_PolII_allGenes_MACSnorm_merged.sbatch
+```
+
+# look at diff peaks for pos v neg reactivation on comb reps
+```{bash}
+dname=macs/broadpeaks
+
+sbatch scripts/bdgdiff.sbatch ${dname}/pos-reactivation_treat_pileup.bdg ${dname}/pos-reactivation_control_lambda.bdg ${dname}/neg-reactivation_treat_pileup.bdg ${dname}/neg-reactivation_control_lambda.bdg POSvNEG
+```
+
+# make DT plots separately for ps2 & ps5
+```{bash}
+sbatch scripts/DTMatrix_pS2_PolII_dTAG_ATACup_MACSnorm_merged.sbatch
+sbatch scripts/DTMatrix_pS2_PolII_2genelists_MACSnorm_merged.sbatch
+sbatch scripts/DTMatrix_pS2_PolII_allGenes_MACSnorm_merged.sbatch
+sbatch scripts/DTMatrix_pS5_PolII_dTAG_ATACup_MACSnorm_merged.sbatch
+sbatch scripts/DTMatrix_pS5_PolII_2genelists_MACSnorm_merged.sbatch
+sbatch scripts/DTMatrix_pS5_PolII_allGenes_MACSnorm_merged.sbatch
+```
+
+# redo all genes w/MANE pc only
+```{bash}
+sbatch scripts/DTMatrix_pS2_PolII_pcGenes_MACSnorm_merged.sbatch
+sbatch scripts/DTMatrix_pS5_PolII_pcGenes_MACSnorm_merged.sbatch
+```
+
+# init R env
+```{r}
+library(data.table)
+library(Rsubread)
+library(ggplot2)
+
+project.dir <- "/dawson_genomics/Projects/MYC/240116_ChIP/"
+plots.dir <- file.path(project.dir, "plots")
+bam.dir <- file.path(project.dir, "alignment")
+```
+
+
+# make CDF travelling ratio plots as in PROseq for each gene group
+```{r}
+mane.bed <- fread("/data/reference/dawson_labs/bed_files/Hg38/Hg38_MANE_ProteinCoding.bed")
+# exclude any tx less than 300bp
+mane.bed <- mane.bed[-which(mane.bed$V3 - mane.bed$V2 <= 300), ]
+
+bam.files <- list.files(bam.dir, pattern = "bulk.*sort.rmdup.bam$", full.names = TRUE)
+
+mane.tss.saf <- data.frame(
+  "GeneID" = mane.bed$V4,
+  "Chr" = mane.bed$V1,
+  "Start" = mane.bed$V2 - 30, 
+  "End" = mane.bed$V2 + 300,
+  "Strand" = mane.bed$V6
+)
+mane.body.saf <- data.frame(
+  "GeneID" = mane.bed$V4,
+  "Chr" = mane.bed$V1,
+  "Start" = mane.bed$V2 + 300, 
+  "End" = mane.bed$V3,
+  "Strand" = mane.bed$V6
+)
+
+# get counts over regions
+mane.tss.counts <- featureCounts(
+  files = bam.files,
+  annot.ext = mane.tss.saf,
+  largestOverlap = TRUE
+)
+mane.body.counts <- featureCounts(
+  files = bam.files,
+  annot.ext = mane.body.saf,
+  largestOverlap = TRUE
+)
+
+# normalise with CPMs
+mane.tss.norm <- as.matrix(mane.tss.counts$counts) %*% diag(colSums(mane.body.counts$counts)/1000000)
+colnames(mane.tss.norm) <- colnames(mane.tss.counts$counts)
+
+mane.body.norm <- as.matrix(mane.body.counts$counts) %*% diag(colSums(mane.body.counts$counts)/1000000)
+colnames(mane.body.norm) <- colnames(mane.body.counts$counts)
+
+# get mean across replicates
+mane.tss.mean <- data.frame(
+  "A485-dTAG-pS2-Pol2" = rowMeans(mane.tss.norm[, grepl("A485-dTAG-pS2-Pol2", colnames(mane.tss.norm))]), 
+  "A485-dTAG-pS5-Pol2" = rowMeans(mane.tss.norm[, grepl("A485-dTAG-pS5-Pol2", colnames(mane.tss.norm))]), 
+  "A485-pS2-Pol2" = rowMeans(mane.tss.norm[, grepl("A485-pS2-Pol2", colnames(mane.tss.norm))]),
+  "A485-pS5-Pol2" = rowMeans(mane.tss.norm[, grepl("A485(-pS2)?-pS5-Pol2", colnames(mane.tss.norm))]), 
+  "DMSO-pS2-Pol2" = rowMeans(mane.tss.norm[, grepl("DMSO-pS2-Pol2", colnames(mane.tss.norm))]),
+  "DMSO-pS5-Pol2" = rowMeans(mane.tss.norm[, grepl("DMSO(-pS2)?-pS5-Pol2", colnames(mane.tss.norm))])
+  )
+
+mane.body.mean <- data.frame(
+  "A485-dTAG-pS2-Pol2" = rowMeans(mane.body.norm[, grepl("A485-dTAG-pS2-Pol2", colnames(mane.body.norm))]), 
+  "A485-dTAG-pS5-Pol2" = rowMeans(mane.body.norm[, grepl("A485-dTAG-pS5-Pol2", colnames(mane.body.norm))]), 
+  "A485-pS2-Pol2" = rowMeans(mane.body.norm[, grepl("A485-pS2-Pol2", colnames(mane.body.norm))]),
+  "A485-pS5-Pol2" = rowMeans(mane.body.norm[, grepl("A485(-pS2)?-pS5-Pol2", colnames(mane.body.norm))]), 
+  "DMSO-pS2-Pol2" = rowMeans(mane.body.norm[, grepl("DMSO-pS2-Pol2", colnames(mane.body.norm))]),
+  "DMSO-pS5-Pol2" = rowMeans(mane.body.norm[, grepl("DMSO(-pS2)?-pS5-Pol2", colnames(mane.body.norm))])
+  )
+
+# get ratio of TSS/body for each sample, use log scale for readability
+mane.tr <- log10(mane.tss.mean/mane.body.mean)
+# remove infinite values
+mane.tr <- as.data.frame(mane.tr[which(is.finite(mane.tr[, 1])),])
+
+# long format for ggplots
+r.cdf.data <- data.frame()
+for(k in 1:6){
+  s.tr <- mane.tr[, k]
+  s.cdf <- cbind(rep(colnames(mane.tr)[k], length(s.tr)), s.tr)
+  r.cdf.data <- rbind(r.cdf.data, s.cdf)
+}
+colnames(r.cdf.data) <- c("sample", "logTR")
+r.cdf.data$logTR <- as.numeric(r.cdf.data$logTR)
+
+# make CDF plots
+pdf("plots/CDF_travelling_ratio_maneTx.pdf")
+  ggplot(r.cdf.data, aes(logTR, colour = sample)) +
+    stat_ecdf() +
+    theme_bw() +
+    theme(panel.grid = element_blank()) +
+    ggtitle("Cumulative distribution of travelling ratio") +
+    xlab("log(travelling ratio)") +
+    ylab("proportion")
+dev.off()
+```
+
+# try TR using TES + 3k
+```{r}
+# only need to redefine body region
+mane.body.saf <- data.frame(
+  "GeneID" = mane.bed$V4,
+  "Chr" = mane.bed$V1,
+  "Start" = mane.bed$V2 + 300, 
+  "End" = mane.bed$V3 + 3000,
+  "Strand" = mane.bed$V6
+)
+
+# get counts over regions
+mane.body.counts <- featureCounts(
+  files = bam.files,
+  annot.ext = mane.body.saf,
+  largestOverlap = TRUE
+)
+
+# normalise with CPM
+mane.tss.norm <- as.matrix(mane.tss.counts$counts) %*% diag(colSums(mane.body.counts$counts)/1000000)
+colnames(mane.tss.norm) <- colnames(mane.tss.counts$counts)
+
+mane.body.norm <- as.matrix(mane.body.counts$counts) %*% diag(colSums(mane.body.counts$counts)/1000000)
+colnames(mane.body.norm) <- colnames(mane.body.counts$counts)
+
+# get mean across replicates
+mane.tss.mean <- data.frame(
+  "A485-dTAG-pS2-Pol2" = rowMeans(mane.tss.norm[, grepl("A485-dTAG-pS2-Pol2", colnames(mane.tss.norm))]), 
+  "A485-dTAG-pS5-Pol2" = rowMeans(mane.tss.norm[, grepl("A485-dTAG-pS5-Pol2", colnames(mane.tss.norm))]), 
+  "A485-pS2-Pol2" = rowMeans(mane.tss.norm[, grepl("A485-pS2-Pol2", colnames(mane.tss.norm))]),
+  "A485-pS5-Pol2" = rowMeans(mane.tss.norm[, grepl("A485(-pS2)?-pS5-Pol2", colnames(mane.tss.norm))]), 
+  "DMSO-pS2-Pol2" = rowMeans(mane.tss.norm[, grepl("DMSO-pS2-Pol2", colnames(mane.tss.norm))]),
+  "DMSO-pS5-Pol2" = rowMeans(mane.tss.norm[, grepl("DMSO(-pS2)?-pS5-Pol2", colnames(mane.tss.norm))])
+  )
+
+mane.body.mean <- data.frame(
+  "A485-dTAG-pS2-Pol2" = rowMeans(mane.body.norm[, grepl("A485-dTAG-pS2-Pol2", colnames(mane.body.norm))]), 
+  "A485-dTAG-pS5-Pol2" = rowMeans(mane.body.norm[, grepl("A485-dTAG-pS5-Pol2", colnames(mane.body.norm))]), 
+  "A485-pS2-Pol2" = rowMeans(mane.body.norm[, grepl("A485-pS2-Pol2", colnames(mane.body.norm))]),
+  "A485-pS5-Pol2" = rowMeans(mane.body.norm[, grepl("A485(-pS2)?-pS5-Pol2", colnames(mane.body.norm))]), 
+  "DMSO-pS2-Pol2" = rowMeans(mane.body.norm[, grepl("DMSO-pS2-Pol2", colnames(mane.body.norm))]),
+  "DMSO-pS5-Pol2" = rowMeans(mane.body.norm[, grepl("DMSO(-pS2)?-pS5-Pol2", colnames(mane.body.norm))])
+  )
+
+# get ratio of TSS/body for each sample, use log scale for readability
+mane.tr <- log10(mane.tss.mean/mane.body.mean)
+# remove infinite values
+mane.tr <- as.data.frame(mane.tr[which(is.finite(rowMeans(mane.tr))),])
+
+# long format for ggplots
+r.cdf.data <- data.frame()
+for(k in 1:6){
+  s.tr <- mane.tr[, k]
+  s.cdf <- cbind(rep(colnames(mane.tr)[k], length(s.tr)), s.tr)
+  r.cdf.data <- rbind(r.cdf.data, s.cdf)
+}
+colnames(r.cdf.data) <- c("sample", "logTR")
+r.cdf.data$logTR <- as.numeric(r.cdf.data$logTR)
+
+# make CDF plots
+pdf("plots/CDF_TR3k_maneTx.pdf")
+  ggplot(r.cdf.data, aes(logTR, colour = sample)) +
+    stat_ecdf() +
+    theme_bw() +
+    theme(panel.grid = element_blank()) +
+    ggtitle("Cumulative distribution of travelling ratio") +
+    xlab("log(travelling ratio)") +
+    ylab("proportion")
+dev.off()
+```
+
+# also get TR on expr genes from TTseq
+```{r}
+# top 50% and 25% made a bit of different but not substantial, trying top 10% instead
+exp.genes <- scan("/dawson_genomics/Projects/MYC/230420_TTseq/results/topDecExpGenes.txt", what = character())
+# subset bed by genes and rerun TR calculations
+exp.genes.bed <- mane.bed[which(mane.bed$V4 %in% exp.genes), ]
+
+# no redo TR over these genes
+exp.tss.saf <- data.frame(
+  "GeneID" = exp.genes.bed$V4,
+  "Chr" = exp.genes.bed$V1,
+  "Start" = exp.genes.bed$V2 - 30, 
+  "End" = exp.genes.bed$V2 + 300,
+  "Strand" = exp.genes.bed$V6
+)
+exp.body.saf <- data.frame(
+  "GeneID" = exp.genes.bed$V4,
+  "Chr" = exp.genes.bed$V1,
+  "Start" = exp.genes.bed$V2 + 300, 
+  "End" = exp.genes.bed$V3 + 3000,
+  "Strand" = exp.genes.bed$V6
+)
+
+# get counts over regions
+exp.tss.counts <- featureCounts(
+  files = bam.files,
+  annot.ext = exp.tss.saf,
+  largestOverlap = TRUE
+)
+exp.body.counts <- featureCounts(
+  files = bam.files,
+  annot.ext = exp.body.saf,
+  largestOverlap = TRUE
+)
+
+# normalise with CPMs
+exp.tss.norm <- as.matrix(exp.tss.counts$counts) %*% diag(colSums(exp.body.counts$counts)/1000000)
+colnames(exp.tss.norm) <- colnames(exp.tss.counts$counts)
+
+exp.body.norm <- as.matrix(exp.body.counts$counts) %*% diag(colSums(exp.body.counts$counts)/1000000)
+colnames(exp.body.norm) <- colnames(exp.body.counts$counts)
+
+# get mean across replicates
+exp.tss.mean <- data.frame(
+  "A485-dTAG-pS2-Pol2" = rowMeans(exp.tss.norm[, grepl("A485-dTAG-pS2-Pol2", colnames(exp.tss.norm))]), 
+  "A485-dTAG-pS5-Pol2" = rowMeans(exp.tss.norm[, grepl("A485-dTAG-pS5-Pol2", colnames(exp.tss.norm))]), 
+  "A485-pS2-Pol2" = rowMeans(exp.tss.norm[, grepl("A485-pS2-Pol2", colnames(exp.tss.norm))]),
+  "A485-pS5-Pol2" = rowMeans(exp.tss.norm[, grepl("A485(-pS2)?-pS5-Pol2", colnames(exp.tss.norm))]), 
+  "DMSO-pS2-Pol2" = rowMeans(exp.tss.norm[, grepl("DMSO-pS2-Pol2", colnames(exp.tss.norm))]),
+  "DMSO-pS5-Pol2" = rowMeans(exp.tss.norm[, grepl("DMSO(-pS2)?-pS5-Pol2", colnames(exp.tss.norm))])
+  )
+
+exp.body.mean <- data.frame(
+  "A485-dTAG-pS2-Pol2" = rowMeans(exp.body.norm[, grepl("A485-dTAG-pS2-Pol2", colnames(exp.body.norm))]), 
+  "A485-dTAG-pS5-Pol2" = rowMeans(exp.body.norm[, grepl("A485-dTAG-pS5-Pol2", colnames(exp.body.norm))]), 
+  "A485-pS2-Pol2" = rowMeans(exp.body.norm[, grepl("A485-pS2-Pol2", colnames(exp.body.norm))]),
+  "A485-pS5-Pol2" = rowMeans(exp.body.norm[, grepl("A485(-pS2)?-pS5-Pol2", colnames(exp.body.norm))]), 
+  "DMSO-pS2-Pol2" = rowMeans(exp.body.norm[, grepl("DMSO-pS2-Pol2", colnames(exp.body.norm))]),
+  "DMSO-pS5-Pol2" = rowMeans(exp.body.norm[, grepl("DMSO(-pS2)?-pS5-Pol2", colnames(exp.body.norm))])
+  )
+
+# get ratio of TSS/body for each sample, use log scale for readability
+exp.tr <- log10(exp.tss.mean/exp.body.mean)
+# remove infinite values
+exp.tr <- as.data.frame(exp.tr[which(is.finite(rowMeans(exp.tr))),])
+
+# long format for ggplots
+r.cdf.data <- data.frame()
+for(k in 1:6){
+  s.tr <- exp.tr[, k]
+  s.cdf <- cbind(rep(colnames(exp.tr)[k], length(s.tr)), s.tr)
+  r.cdf.data <- rbind(r.cdf.data, s.cdf)
+}
+colnames(r.cdf.data) <- c("sample", "logTR")
+r.cdf.data$logTR <- as.numeric(r.cdf.data$logTR)
+
+# make CDF plots
+pdf("plots/CDF_TR3k_expGenes.pdf")
+  ggplot(r.cdf.data, aes(logTR, colour = sample)) +
+    stat_ecdf() +
+    theme_bw() +
+    theme(panel.grid = element_blank()) +
+    ggtitle("Cumulative distribution of travelling ratio") +
+    xlab("log(travelling ratio)") +
+    ylab("proportion")
+dev.off()
+```
+
+# also get TR on reactivated and non-reactivated genes
+```{r}
+# get react genes bed
+react.bed <- fread("/dawson_genomics/Projects/MYC/230420_TTseq/bed_files/reactivated_genes.bed")
+
+# now redo TR over these genes
+react.tss.saf <- data.frame(
+  "GeneID" = react.bed$V4,
+  "Chr" = react.bed$V1,
+  "Start" = react.bed$V2 - 30, 
+  "End" = react.bed$V2 + 300,
+  "Strand" = react.bed$V6
+)
+react.body.saf <- data.frame(
+  "GeneID" = react.bed$V4,
+  "Chr" = react.bed$V1,
+  "Start" = react.bed$V2 + 300, 
+  "End" = react.bed$V3 + 3000,
+  "Strand" = react.bed$V6
+)
+
+# get counts over regions
+react.tss.counts <- featureCounts(
+  files = bam.files,
+  annot.ext = react.tss.saf,
+  largestOverlap = TRUE
+)
+react.body.counts <- featureCounts(
+  files = bam.files,
+  annot.ext = react.body.saf,
+  largestOverlap = TRUE
+)
+
+# normalise with CPMs
+react.tss.norm <- as.matrix(react.tss.counts$counts) %*% diag(colSums(react.body.counts$counts)/1000000)
+colnames(react.tss.norm) <- colnames(react.tss.counts$counts)
+
+react.body.norm <- as.matrix(react.body.counts$counts) %*% diag(colSums(react.body.counts$counts)/1000000)
+colnames(react.body.norm) <- colnames(react.body.counts$counts)
+
+# get mean across replicates
+react.tss.mean <- data.frame(
+  "A485-dTAG-pS2-Pol2" = rowMeans(react.tss.norm[, grepl("A485-dTAG-pS2-Pol2", colnames(react.tss.norm))]), 
+  "A485-dTAG-pS5-Pol2" = rowMeans(react.tss.norm[, grepl("A485-dTAG-pS5-Pol2", colnames(react.tss.norm))]), 
+  "A485-pS2-Pol2" = rowMeans(react.tss.norm[, grepl("A485-pS2-Pol2", colnames(react.tss.norm))]),
+  "A485-pS5-Pol2" = rowMeans(react.tss.norm[, grepl("A485(-pS2)?-pS5-Pol2", colnames(react.tss.norm))]), 
+  "DMSO-pS2-Pol2" = rowMeans(react.tss.norm[, grepl("DMSO-pS2-Pol2", colnames(react.tss.norm))]),
+  "DMSO-pS5-Pol2" = rowMeans(react.tss.norm[, grepl("DMSO(-pS2)?-pS5-Pol2", colnames(react.tss.norm))])
+  )
+
+react.body.mean <- data.frame(
+  "A485-dTAG-pS2-Pol2" = rowMeans(react.body.norm[, grepl("A485-dTAG-pS2-Pol2", colnames(react.body.norm))]), 
+  "A485-dTAG-pS5-Pol2" = rowMeans(react.body.norm[, grepl("A485-dTAG-pS5-Pol2", colnames(react.body.norm))]), 
+  "A485-pS2-Pol2" = rowMeans(react.body.norm[, grepl("A485-pS2-Pol2", colnames(react.body.norm))]),
+  "A485-pS5-Pol2" = rowMeans(react.body.norm[, grepl("A485(-pS2)?-pS5-Pol2", colnames(react.body.norm))]), 
+  "DMSO-pS2-Pol2" = rowMeans(react.body.norm[, grepl("DMSO-pS2-Pol2", colnames(react.body.norm))]),
+  "DMSO-pS5-Pol2" = rowMeans(react.body.norm[, grepl("DMSO(-pS2)?-pS5-Pol2", colnames(react.body.norm))])
+  )
+
+# get ratio of TSS/body for each sample, use log scale for readability
+react.tr <- log10(react.tss.mean/react.body.mean)
+# remove infinite values
+react.tr <- as.data.frame(react.tr[which(is.finite(rowMeans(react.tr))),])
+
+# long format for ggplots
+r.cdf.data <- data.frame()
+for(k in 1:6){
+  s.tr <- react.tr[, k]
+  s.cdf <- cbind(rep(colnames(react.tr)[k], length(s.tr)), s.tr)
+  r.cdf.data <- rbind(r.cdf.data, s.cdf)
+}
+colnames(r.cdf.data) <- c("sample", "logTR")
+r.cdf.data$logTR <- as.numeric(r.cdf.data$logTR)
+
+# make CDF plots
+pdf("plots/CDF_TR3k_reactGenes.pdf")
+  ggplot(r.cdf.data, aes(logTR, colour = sample)) +
+    stat_ecdf() +
+    theme_bw() +
+    theme(panel.grid = element_blank()) +
+    ggtitle("Cumulative distribution of travelling ratio") +
+    xlab("log(travelling ratio)") +
+    ylab("proportion")
+dev.off()
+
+# now non-react genes 
+nonreact.bed <- fread("/dawson_genomics/Projects/MYC/230420_TTseq/bed_files/nonreactivated_genes.bed")
+
+# now redo TR over these genes
+nonreact.tss.saf <- data.frame(
+  "GeneID" = nonreact.bed$V4,
+  "Chr" = nonreact.bed$V1,
+  "Start" = nonreact.bed$V2 - 30, 
+  "End" = nonreact.bed$V2 + 300,
+  "Strand" = nonreact.bed$V6
+)
+nonreact.body.saf <- data.frame(
+  "GeneID" = nonreact.bed$V4,
+  "Chr" = nonreact.bed$V1,
+  "Start" = nonreact.bed$V2 + 300, 
+  "End" = nonreact.bed$V3 + 3000,
+  "Strand" = nonreact.bed$V6
+)
+
+# get counts over regions
+nonreact.tss.counts <- featureCounts(
+  files = bam.files,
+  annot.ext = nonreact.tss.saf,
+  largestOverlap = TRUE
+)
+nonreact.body.counts <- featureCounts(
+  files = bam.files,
+  annot.ext = nonreact.body.saf,
+  largestOverlap = TRUE
+)
+
+# normalise with CPMs
+nonreact.tss.norm <- as.matrix(nonreact.tss.counts$counts) %*% diag(colSums(nonreact.body.counts$counts)/1000000)
+colnames(nonreact.tss.norm) <- colnames(nonreact.tss.counts$counts)
+
+nonreact.body.norm <- as.matrix(nonreact.body.counts$counts) %*% diag(colSums(nonreact.body.counts$counts)/1000000)
+colnames(nonreact.body.norm) <- colnames(nonreact.body.counts$counts)
+
+# get mean across replicates
+nonreact.tss.mean <- data.frame(
+  "A485-dTAG-pS2-Pol2" = rowMeans(nonreact.tss.norm[, grepl("A485-dTAG-pS2-Pol2", colnames(nonreact.tss.norm))]), 
+  "A485-dTAG-pS5-Pol2" = rowMeans(nonreact.tss.norm[, grepl("A485-dTAG-pS5-Pol2", colnames(nonreact.tss.norm))]), 
+  "A485-pS2-Pol2" = rowMeans(nonreact.tss.norm[, grepl("A485-pS2-Pol2", colnames(nonreact.tss.norm))]),
+  "A485-pS5-Pol2" = rowMeans(nonreact.tss.norm[, grepl("A485(-pS2)?-pS5-Pol2", colnames(nonreact.tss.norm))]), 
+  "DMSO-pS2-Pol2" = rowMeans(nonreact.tss.norm[, grepl("DMSO-pS2-Pol2", colnames(nonreact.tss.norm))]),
+  "DMSO-pS5-Pol2" = rowMeans(nonreact.tss.norm[, grepl("DMSO(-pS2)?-pS5-Pol2", colnames(nonreact.tss.norm))])
+  )
+
+nonreact.body.mean <- data.frame(
+  "A485-dTAG-pS2-Pol2" = rowMeans(nonreact.body.norm[, grepl("A485-dTAG-pS2-Pol2", colnames(nonreact.body.norm))]), 
+  "A485-dTAG-pS5-Pol2" = rowMeans(nonreact.body.norm[, grepl("A485-dTAG-pS5-Pol2", colnames(nonreact.body.norm))]), 
+  "A485-pS2-Pol2" = rowMeans(nonreact.body.norm[, grepl("A485-pS2-Pol2", colnames(nonreact.body.norm))]),
+  "A485-pS5-Pol2" = rowMeans(nonreact.body.norm[, grepl("A485(-pS2)?-pS5-Pol2", colnames(nonreact.body.norm))]), 
+  "DMSO-pS2-Pol2" = rowMeans(nonreact.body.norm[, grepl("DMSO-pS2-Pol2", colnames(nonreact.body.norm))]),
+  "DMSO-pS5-Pol2" = rowMeans(nonreact.body.norm[, grepl("DMSO(-pS2)?-pS5-Pol2", colnames(nonreact.body.norm))])
+  )
+
+# get ratio of TSS/body for each sample, use log scale for readability
+nonreact.tr <- log10(nonreact.tss.mean/nonreact.body.mean)
+# remove infinite values
+nonreact.tr <- as.data.frame(nonreact.tr[which(is.finite(rowMeans(nonreact.tr))),])
+
+# long format for ggplots
+r.cdf.data <- data.frame()
+for(k in 1:6){
+  s.tr <- nonreact.tr[, k]
+  s.cdf <- cbind(rep(colnames(nonreact.tr)[k], length(s.tr)), s.tr)
+  r.cdf.data <- rbind(r.cdf.data, s.cdf)
+}
+colnames(r.cdf.data) <- c("sample", "logTR")
+r.cdf.data$logTR <- as.numeric(r.cdf.data$logTR)
+
+# make CDF plots
+pdf("plots/CDF_TR3k_nonreactGenes.pdf")
+  ggplot(r.cdf.data, aes(logTR, colour = sample)) +
+    stat_ecdf() +
+    theme_bw() +
+    theme(panel.grid = element_blank()) +
+    ggtitle("Cumulative distribution of travelling ratio") +
+    xlab("log(travelling ratio)") +
+    ylab("proportion")
+dev.off()
+```
+
+
+
+# save session info
+```{r}
+sesh.info <- capture.output(sessionInfo())
+writeLines(
+  sesh.info,
+  file.path(project.dir, "session-info", paste0(Sys.Date(), "_ChIPseq_240116.txt"))
+)
+```
