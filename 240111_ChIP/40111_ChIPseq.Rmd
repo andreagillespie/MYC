@@ -1,0 +1,88 @@
+---
+title: "ChIPseq_240111"
+author: "Andrea"
+date: "2024/01/15"
+output: html_document
+---
+
+fastq location: /pipeline/Runs/NextSeq/240111_VH01624_61_AAF2YLHM5/ProjectFolders/Project_Jesse-Balic/
+project directory: /dawson_genomics/Projects/MYC/240111_ChIP/
+
+# set up project dir and process (fastqc, trim, align, tdfs)
+```{bash}
+mkdir alignment
+mkdir fastqc
+mkdir trimmed_fastqs
+mkdir logs
+mkdir scripts
+mkdir tdfs
+
+for fq in /pipeline/Runs/NextSeq/240111_VH01624_61_AAF2YLHM5/ProjectFolders/Project_Jesse-Balic/Sample*/*_R1_001.fastq.gz
+do
+sbatch scripts/alignHg38.sbatch $fq
+done
+
+module load multiqc/1.8
+multiqc .
+```
+
+# peak calling (both narrow and broad) include bedgraph output for Spark plots and diff peaks if needed
+```{bash}
+mkdir macs/narrowpeaks
+mkdir macs/broadpeaks
+
+for bam in alignment/R[1-3]-[bnp]*sort.rmdup.bam
+do
+sbatch scripts/macs2.sbatch $bam alignment/R1-input_S8.sort.rmdup.bam
+done
+```
+
+# make bigwigs from macs bedgraph output as in other experiments
+```{bash}
+for bdg in macs/broadpeaks/*_treat_pileup.bdg
+do
+sbatch scripts/bedgraphToBigwig.sbatch $bdg
+done
+```
+
+# make metaplots from macs norm bigwigs for all genes, 2 genesets and ATAC intergenic as in other exps
+```{bash}
+sbatch scripts/DTMatrix_PolII_allGenes_MACSnorm.sbatch
+sbatch scripts/DTMatrix_PolII_2genelists_MACSnorm.sbatch
+sbatch scripts/DTMatrix_PolII_dTAG_ATACup_MACSnorm.sbatch
+```
+
+# combine reps, get bigwigs for comb reps and make new heatmaps
+```{bash}
+module load macs/2.2.7.1
+cd macs/broadpeaks
+
+macs2 cmbreps -i R1-bulk-A485-dTAG_S4_treat_pileup.bdg R2-bulk-A485-dTAG_S5_treat_pileup.bdg R3-bulk-A485-dTAG_S6_treat_pileup.bdg -m mean -o bulk-A485-dTAG_treat_pileup.bdg
+macs2 cmbreps -i R1-bulk-A485_S10_treat_pileup.bdg R2-bulk-A485_S14_treat_pileup.bdg R3-bulk-A485_S1_treat_pileup.bdg -m mean -o bulk-A485_treat_pileup.bdg
+macs2 cmbreps -i R1-bulk-DMSO_S9_treat_pileup.bdg R2-bulk-DMSO_S13_treat_pileup.bdg R3-bulk-DMSO_S17_treat_pileup.bdg -m mean -o bulk-DMSO_treat_pileup.bdg
+macs2 cmbreps -i R1-neg-reactivation_S11_treat_pileup.bdg R2-neg-reactivation_S15_treat_pileup.bdg R3-neg-reactivation_S2_treat_pileup.bdg -m mean -o neg-reactivation_treat_pileup.bdg
+macs2 cmbreps -i R1-pos-reactivation_S12_treat_pileup.bdg R2-pos-reactivation_S16_treat_pileup.bdg R3-pos-reactivation_S3_treat_pileup.bdg -m mean -o pos-reactivation_treat_pileup.bdg
+
+macs2 cmbreps -i R1-bulk-A485-dTAG_S4_control_lambda.bdg R2-bulk-A485-dTAG_S5_control_lambda.bdg R3-bulk-A485-dTAG_S6_control_lambda.bdg -m mean -o bulk-A485-dTAG_control_lambda.bdg
+macs2 cmbreps -i R1-bulk-A485_S10_control_lambda.bdg R2-bulk-A485_S14_control_lambda.bdg R3-bulk-A485_S1_control_lambda.bdg -m mean -o bulk-A485_control_lambda.bdg
+macs2 cmbreps -i R1-bulk-DMSO_S9_control_lambda.bdg R2-bulk-DMSO_S13_control_lambda.bdg R3-bulk-DMSO_S17_control_lambda.bdg -m mean -o bulk-DMSO_control_lambda.bdg
+macs2 cmbreps -i R1-neg-reactivation_S11_control_lambda.bdg R2-neg-reactivation_S15_control_lambda.bdg R3-neg-reactivation_S2_control_lambda.bdg -m mean -o neg-reactivation_control_lambda.bdg
+macs2 cmbreps -i R1-pos-reactivation_S12_control_lambda.bdg R2-pos-reactivation_S16_control_lambda.bdg R3-pos-reactivation_S3_control_lambda.bdg -m mean -o pos-reactivation_control_lambda.bdg
+
+cd ../..
+for bdg in macs/broadpeaks/[bnp]*_treat_pileup.bdg
+do
+sbatch scripts/bedgraphToBigwig.sbatch $bdg
+done
+
+sbatch scripts/DTMatrix_PolII_dTAG_ATACup_MACSnorm_merged.sbatch
+sbatch scripts/DTMatrix_PolII_2genelists_MACSnorm_merged.sbatch
+sbatch scripts/DTMatrix_PolII_allGenes_MACSnorm_merged.sbatch
+```
+
+# look at diff peaks for pos v neg reactivation on comb reps
+```{bash}
+dname=macs/broadpeaks
+
+sbatch scripts/bdgdiff.sbatch ${dname}/pos-reactivation_treat_pileup.bdg ${dname}/pos-reactivation_control_lambda.bdg ${dname}/neg-reactivation_treat_pileup.bdg ${dname}/neg-reactivation_control_lambda.bdg POSvNEG
+```
