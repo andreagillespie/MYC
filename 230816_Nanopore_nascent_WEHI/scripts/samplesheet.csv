@@ -1,0 +1,12 @@
+group,replicate,barcode,input_file,fasta,gtf
+ND,1,,/dawson_genomics/Projects/MYC/230816_Nanopore_nascent_WEHI/raw_data/Run1/TTpool/20230816_1301_2E_PAQ61146_13980f4f/fastq_pass/barcode01/barcode01.fastq.gz,hg38,
+NP,1,,/dawson_genomics/Projects/MYC/230816_Nanopore_nascent_WEHI/raw_data/Run1/TTpool/20230816_1301_2E_PAQ61146_13980f4f/fastq_pass/barcode02/barcode02.fastq.gz,hg38,
+dD,1,,/dawson_genomics/Projects/MYC/230816_Nanopore_nascent_WEHI/raw_data/Run1/TTpool/20230816_1301_2E_PAQ61146_13980f4f/fastq_pass/barcode03/barcode03.fastq.gz,hg38,
+dP,1,,/dawson_genomics/Projects/MYC/230816_Nanopore_nascent_WEHI/raw_data/Run1/TTpool/20230816_1301_2E_PAQ61146_13980f4f/fastq_pass/barcode04/barcode04.fastq.gz,hg38,
+ND,2,,/dawson_genomics/Projects/MYC/230816_Nanopore_nascent_WEHI/raw_data/Run1/TTpool/20230816_1301_2E_PAQ61146_13980f4f/fastq_pass/barcode05/barcode05.fastq.gz,hg38,
+NP,2,,/dawson_genomics/Projects/MYC/230816_Nanopore_nascent_WEHI/raw_data/Run1/TTpool/20230816_1301_2E_PAQ61146_13980f4f/fastq_pass/barcode07/barcode07.fastq.gz,hg38,
+dD,2,,/dawson_genomics/Projects/MYC/230816_Nanopore_nascent_WEHI/raw_data/Run1/TTpool/20230816_1301_2E_PAQ61146_13980f4f/fastq_pass/barcode08/barcode08.fastq.gz,hg38,
+dP,2,,/dawson_genomics/Projects/MYC/230816_Nanopore_nascent_WEHI/raw_data/Run1/TTpool/20230816_1301_2E_PAQ61146_13980f4f/fastq_pass/barcode09/barcode09.fastq.gz,hg38,
+NP,3,,/dawson_genomics/Projects/MYC/230816_Nanopore_nascent_WEHI/raw_data/Run1/TTpool/20230816_1301_2E_PAQ61146_13980f4f/fastq_pass/barcode11/barcode11.fastq.gz,hg38,
+dD,3,,/dawson_genomics/Projects/MYC/230816_Nanopore_nascent_WEHI/raw_data/Run1/TTpool/20230816_1301_2E_PAQ61146_13980f4f/fastq_pass/barcode12/barcode12.fastq.gz,hg38,
+dP,3,,/dawson_genomics/Projects/MYC/230816_Nanopore_nascent_WEHI/raw_data/Run1/TTpool/20230816_1301_2E_PAQ61146_13980f4f/fastq_pass/barcode13/barcode13.fastq.gz,hg38,
