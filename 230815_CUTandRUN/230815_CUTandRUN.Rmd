@@ -1,0 +1,591 @@
+---
+title: "230815_CUTandRUN"
+author: "Andrea"
+date: '2023-08-23'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+fastq dir: /pipeline/Runs/NextSeq/230815_NB501056_0979_AH2VMLBGXV/ProjectFolders/Project_Dane-Vassiliadis/
+project dir: /dawson_genomics/Projects/MYC/230815_CUTandRUN
+
+# QC, trim, & align fastqs in a smiliar fashion to cutandruntools also with shell loop from epicypher for kmetstat spike-in
+# fragments with same coords are expected due to protocol, so dups not removed
+```{bash}
+for fq in /pipeline/Runs/NextSeq/230815_NB501056_0979_AH2VMLBGXV/ProjectFolders/Project_Dane-Vassiliadis/*/*_R1_001.fastq.gz
+do
+sbatch scripts/CnR_trim_align.sbatch $fq
+done
+
+module load multiqc/1.8
+multiqc .
+```
+
+# run macs for peak calling, again similar to cutandruntools usage of macs, but qvalue set to 0.05 (rather than 0.01) and also doing broad peaks
+```{bash}
+for bam in alignment/*sort.bam
+do
+sbatch scripts/macs2.sbatch $bam
+done
+```
+
+# get bam stats for spike in and samples
+```{bash}
+module load samtools/1.4.1
+
+for bam in alignment/*sort.Ecoli.bam
+do
+echo $bam >> alignment/EcoliBamFlagstat.txt
+samtools flagstat $bam >> alignment/EcoliBamFlagstat.txt
+done
+
+# also get stats for human
+for bam in alignment/*sort.bam
+do
+echo $bam >> alignment/BamFlagstat.txt
+samtools flagstat $bam >> alignment/BamFlagstat.txt
+done
+```
+
+# Load R libraries and set paths
+```{r}
+library(data.table)
+library(limma)
+library(GenomicRanges)
+library(dplyr)
+library(Rsubread)
+library(edgeR)
+
+project.dir <- "/dawson_genomics/Projects/MYC/230815_CUTandRUN"
+align.dir <- file.path(project.dir, "alignment")
+peaks.dir <- file.path(project.dir, "macs/broadpeaks")
+```
+
+# collate DM counts, use lib sizes to get scale factor for bigwigs
+```{r}
+ec.stat <- read.table(file.path(align.dir, "EcoliBamFlagstat.txt"), header = FALSE, fill = TRUE)
+ec.files <- ec.stat[grep("Ecoli.bam", ec.stat$V1), 1]
+ec.reads <- ec.stat[grep("total", t(ec.stat$V5)), 1]
+
+# make text file with bam names and scale factors to use for deeptools
+# scale factor for each is 10000000/Dm reads
+bam.sf <- cbind(gsub("sort.Ecoli.bam", "sort.bam", ec.files), 10000000/as.numeric(ec.reads))
+write.table(
+  bam.sf,
+  file.path(align.dir, "bam_sf.txt"),
+  sep = ":",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+
+# make comparison of spike in v human reads
+hs.stat <- read.table(file.path(align.dir, "BamFlagstat.txt"), header = FALSE, fill = TRUE)
+hs.reads <- hs.stat[grep("total", t(ec.stat$V5)), 1]
+hs.sf <- cbind(bam.sf, ec.reads, 1000000/as.numeric(hs.reads), hs.reads)
+colnames(hs.sf) <- c("Hs.bam", "Ec.scale.factor", "Ec.reads", "Hs.scale.factor", "Hs.reads")
+write.table(
+  hs.sf,
+  file.path(align.dir, "Hs_Ec_sf.txt"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# make bigwigs norm by coverage and spike-in
+```{bash}
+while read -r line
+do
+IFS=: read -r bam sf <<< $line
+sbatch scripts/DeeptoolsBamCov.sbatch $bam $sf
+done < alignment/bam_sf.txt
+```
+
+# make heatmaps for each mark at each timepoint, comparison of counts/scale factors above shows more variation in spike-in so probably best to use RPGC
+```{bash}
+sbatch scripts/DTMatrix_PRETREAT_POLII.sbatch
+sbatch scripts/DTMatrix_PRETREAT_H3K27ac.sbatch
+sbatch scripts/DTMatrix_PRETREAT_H3K27me3.sbatch
+sbatch scripts/DTMatrix_PRETREAT_H3K4me3.sbatch
+sbatch scripts/DTMatrix_EARLY_H3K27ac.sbatch
+sbatch scripts/DTMatrix_EARLY_H3K27me3.sbatch
+sbatch scripts/DTMatrix_EARLY_H3K4me3.sbatch
+sbatch scripts/DTMatrix_LATE_H3K27ac.sbatch
+sbatch scripts/DTMatrix_LATE_H3K27me3.sbatch
+sbatch scripts/DTMatrix_LATE_H3K4me3.sbatch
+```
+
+# create a master peak list for each mark, then get counts matrix for the peakset and normalise with TMM
+```{r}
+# make master peak list for H3K4me3
+k4m.peaks <- list.files(peaks.dir, pattern = "H3K4me3.*_peaks.broadPeak", full.names = TRUE)
+
+mPeak <- GRanges()
+for(peak in k4m.peaks){
+  peakRes = read.table(
+    peak,
+    header = FALSE, 
+    fill = TRUE
+    )
+  mPeak = GRanges(seqnames = peakRes$V1, IRanges(start = peakRes$V2, end = peakRes$V3), strand = "*") %>% append(mPeak, .)
+}
+masterPeak = reduce(mPeak)
+
+# make saf from master peaks for featureCounts
+mp.df <- as.data.frame(masterPeak)
+mp.df$GeneID <- rownames(mp.df)
+mp.df <- mp.df[, c(6, 1:3, 5)]
+colnames(mp.df)[2:5] <- c("Chr", "Start", "End", "Strand") 
+
+# get read counts for each peak in the master peaks list
+k4m.bams <- list.files(align.dir, pattern = "H3K4me3.*.sort.bam$", full.names = TRUE)
+k4m.counts <- featureCounts(
+  k4m.bams,
+  annot.ext = mp.df,
+  isPairedEnd = FALSE,
+  useMetaFeatures = FALSE
+)
+colnames(k4m.counts$counts) <- gsub(".sort.bam", "", colnames(k4m.counts$counts))
+
+# remove low counts
+keep <- which(rowSums(k4m.counts$counts > 1) >= 2)
+k4m.counts$counts <- k4m.counts$counts[keep, ]
+
+# now load into edger object and TMM normalise
+k4m.dge <- DGEList(k4m.counts$counts)
+k4m.dge <- calcNormFactors(k4m.dge, method = "TMM")
+
+# make and write out scale factor doc to run DT script
+k4m.bam.sf <- paste0("alignment/", rownames(k4m.dge$samples), ".sort.bam:", k4m.dge$samples$norm.factors)
+write.table(
+  k4m.bam.sf,
+  file.path(align.dir, "K4me3_bam_sf.txt"),
+  quote = FALSE,
+  row.names = FALSE,
+  col.names = FALSE
+)
+```
+
+# make new bigwigs norm by TMM
+```{bash}
+while read -r line
+do
+IFS=: read -r bam sf <<< $line
+sbatch scripts/DeeptoolsBamCov.sbatch $bam $sf
+done < alignment/K4me3_bam_sf.txt
+```
+
+# now for k27me3
+```{r}
+# make master peak list
+k27m.peaks <- list.files(peaks.dir, pattern = "H3K27me3.*_peaks.broadPeak", full.names = TRUE)
+
+mPeak <- GRanges()
+for(peak in k27m.peaks){
+  peakRes = read.table(
+    peak,
+    header = FALSE, 
+    fill = TRUE
+    )
+  mPeak = GRanges(seqnames = peakRes$V1, IRanges(start = peakRes$V2, end = peakRes$V3), strand = "*") %>% append(mPeak, .)
+}
+masterPeak = reduce(mPeak)
+
+# make saf from master peaks for featureCounts
+mp.df <- as.data.frame(masterPeak)
+mp.df$GeneID <- rownames(mp.df)
+mp.df <- mp.df[, c(6, 1:3, 5)]
+colnames(mp.df)[2:5] <- c("Chr", "Start", "End", "Strand") 
+
+# get read counts for each peak in the master peaks list
+k27m.bams <- list.files(align.dir, pattern = "H3K27me3.*.sort.bam$", full.names = TRUE)
+k27m.counts <- featureCounts(
+  k27m.bams,
+  annot.ext = mp.df,
+  isPairedEnd = FALSE,
+  useMetaFeatures = FALSE
+)
+colnames(k27m.counts$counts) <- gsub(".sort.bam", "", colnames(k27m.counts$counts))
+
+# remove low counts
+keep <- which(rowSums(k27m.counts$counts > 1) >= 2)
+k27m.counts$counts <- k27m.counts$counts[keep, ]
+
+# now load into edger object and TMM normalise
+k27m.dge <- DGEList(k27m.counts$counts)
+k27m.dge <- calcNormFactors(k27m.dge, method = "TMM")
+
+# make and write out scale factor doc to run DT script
+k27m.bam.sf <- paste0("alignment/", rownames(k27m.dge$samples), ".sort.bam:", k27m.dge$samples$norm.factors)
+write.table(
+  k27m.bam.sf,
+  file.path(align.dir, "K27me3_bam_sf.txt"),
+  quote = FALSE,
+  row.names = FALSE,
+  col.names = FALSE
+)
+```
+
+# make new bigwigs norm by TMM
+```{bash}
+while read -r line
+do
+IFS=: read -r bam sf <<< $line
+sbatch scripts/DeeptoolsBamCov.sbatch $bam $sf
+done < alignment/K27me3_bam_sf.txt
+```
+
+# now for k27ac
+```{r}
+# make master peak list
+k27a.peaks <- list.files(peaks.dir, pattern = "H3K27ac.*_peaks.broadPeak", full.names = TRUE)
+
+mPeak <- GRanges()
+for(peak in k27a.peaks){
+  peakRes = read.table(
+    peak,
+    header = FALSE, 
+    fill = TRUE
+    )
+  mPeak = GRanges(seqnames = peakRes$V1, IRanges(start = peakRes$V2, end = peakRes$V3), strand = "*") %>% append(mPeak, .)
+}
+masterPeak = reduce(mPeak)
+
+# make saf from master peaks for featureCounts
+mp.df <- as.data.frame(masterPeak)
+mp.df$GeneID <- rownames(mp.df)
+mp.df <- mp.df[, c(6, 1:3, 5)]
+colnames(mp.df)[2:5] <- c("Chr", "Start", "End", "Strand") 
+
+# get read counts for each peak in the master peaks list
+k27a.bams <- list.files(align.dir, pattern = "H3K27ac.*.sort.bam$", full.names = TRUE)
+k27a.counts <- featureCounts(
+  k27a.bams,
+  annot.ext = mp.df,
+  isPairedEnd = FALSE,
+  useMetaFeatures = FALSE
+)
+colnames(k27a.counts$counts) <- gsub(".sort.bam", "", colnames(k27a.counts$counts))
+
+# remove low counts
+keep <- which(rowSums(k27a.counts$counts > 1) >= 2)
+k27a.counts$counts <- k27a.counts$counts[keep, ]
+
+# now load into edger object and TMM normalise
+k27a.dge <- DGEList(k27a.counts$counts)
+k27a.dge <- calcNormFactors(k27a.dge, method = "TMM")
+
+# make and write out scale factor doc to run DT script
+k27a.bam.sf <- paste0("alignment/", rownames(k27a.dge$samples), ".sort.bam:", k27a.dge$samples$norm.factors)
+write.table(
+  k27a.bam.sf,
+  file.path(align.dir, "K27ac_bam_sf.txt"),
+  quote = FALSE,
+  row.names = FALSE,
+  col.names = FALSE
+)
+```
+
+# make new bigwigs norm by TMM
+```{bash}
+while read -r line
+do
+IFS=: read -r bam sf <<< $line
+sbatch scripts/DeeptoolsBamCov.sbatch $bam $sf
+done < alignment/K27ac_bam_sf.txt
+```
+
+# now for pol2
+```{r}
+# make master peak list
+pol2.peaks <- list.files(peaks.dir, pattern = "POLII.*_peaks.broadPeak", full.names = TRUE)
+
+mPeak <- GRanges()
+for(peak in pol2.peaks){
+  peakRes = read.table(
+    peak,
+    header = FALSE, 
+    fill = TRUE
+    )
+  mPeak = GRanges(seqnames = peakRes$V1, IRanges(start = peakRes$V2, end = peakRes$V3), strand = "*") %>% append(mPeak, .)
+}
+masterPeak = reduce(mPeak)
+
+# make saf from master peaks for featureCounts
+mp.df <- as.data.frame(masterPeak)
+mp.df$GeneID <- rownames(mp.df)
+mp.df <- mp.df[, c(6, 1:3, 5)]
+colnames(mp.df)[2:5] <- c("Chr", "Start", "End", "Strand") 
+
+# get read counts for each peak in the master peaks list
+pol2.bams <- list.files(align.dir, pattern = "POLII.*.sort.bam$", full.names = TRUE)
+pol2.counts <- featureCounts(
+  pol2.bams,
+  annot.ext = mp.df,
+  isPairedEnd = FALSE,
+  useMetaFeatures = FALSE
+)
+colnames(pol2.counts$counts) <- gsub(".sort.bam", "", colnames(pol2.counts$counts))
+
+# remove low counts
+keep <- which(rowSums(pol2.counts$counts > 1) >= 2)
+pol2.counts$counts <- pol2.counts$counts[keep, ]
+
+# now load into edger object and TMM normalise
+pol2.dge <- DGEList(pol2.counts$counts)
+pol2.dge <- calcNormFactors(pol2.dge, method = "TMM")
+
+# make and write out scale factor doc to run DT script
+pol2.bam.sf <- paste0("alignment/", rownames(pol2.dge$samples), ".sort.bam:", pol2.dge$samples$norm.factors)
+write.table(
+  pol2.bam.sf,
+  file.path(align.dir, "POLII_bam_sf.txt"),
+  quote = FALSE,
+  row.names = FALSE,
+  col.names = FALSE
+)
+```
+
+# make new bigwigs norm by TMM
+```{bash}
+while read -r line
+do
+IFS=: read -r bam sf <<< $line
+sbatch scripts/DeeptoolsBamCov.sbatch $bam $sf
+done < alignment/POLII_bam_sf.txt
+```
+
+# remove S# from bdg filenames to avoid headaches in bash loops
+```{r}
+files <- list.files(peaks.dir, pattern = ".bdg", full.names = TRUE)
+for(file in files){
+  file.rename(file, gsub("_S[0-9]*_", "_", file))
+}
+```
+
+# get differential peaks calls for LATE K4me3 samples
+```{bash}
+# quick and low mem usage so can be run interactively
+module load macs/2.2.7.1
+
+# combine reps first
+for bdg in macs/broadpeaks/*R1_treat_pileup.bdg
+do
+bname=`basename $bdg -R1_treat_pileup.bdg`
+dname=`dirname $bdg`
+macs2 cmbreps -i $bdg $dname/${bname}-R2_treat_pileup.bdg -m mean -o $dname/${bname}_treat_pileup.bdg
+macs2 cmbreps -i $dname/${bname}-R1_control_lambda.bdg $dname/${bname}-R2_control_lambda.bdg -m mean -o $dname/${bname}_control_lambda.bdg
+done
+
+cd macs/broadpeaks
+mkdir macs_diff
+
+# same for pretreat (loop doesn't like clone3vclone5)
+macs2 cmbreps -i PRETREAT-3NEG-H3K27ac-R1_treat_pileup.bdg PRETREAT-5NEG-H3K27ac-R2_treat_pileup.bdg -m mean -o PRETREAT-NEG-H3K27ac_treat_pileup.bdg
+macs2 cmbreps -i PRETREAT-3NEG-H3K27me3-R1_treat_pileup.bdg PRETREAT-5NEG-H3K27me3-R2_treat_pileup.bdg -m mean -o PRETREAT-NEG-H3K27me3_treat_pileup.bdg
+macs2 cmbreps -i PRETREAT-3NEG-H3K4me3-R1_treat_pileup.bdg PRETREAT-5NEG-H3K4me3-R2_treat_pileup.bdg -m mean -o PRETREAT-NEG-H3K4me3_treat_pileup.bdg
+macs2 cmbreps -i PRETREAT-3NEG-POLII-R1_treat_pileup.bdg PRETREAT-5NEG-POLII-R2_treat_pileup.bdg -m mean -o PRETREAT-NEG-POLII_treat_pileup.bdg
+macs2 cmbreps -i PRETREAT-3V-H3K27ac-R1_treat_pileup.bdg PRETREAT-5V-H3K27ac-R2_treat_pileup.bdg -m mean -o PRETREAT-V-H3K27ac_treat_pileup.bdg
+macs2 cmbreps -i PRETREAT-3V-H3K27me3-R1_treat_pileup.bdg PRETREAT-5V-H3K27me3-R2_treat_pileup.bdg -m mean -o PRETREAT-V-H3K27me3_treat_pileup.bdg
+macs2 cmbreps -i PRETREAT-3V-H3K4me3-R1_treat_pileup.bdg PRETREAT-5V-H3K4me3-R2_treat_pileup.bdg -m mean -o PRETREAT-V-H3K4me3_treat_pileup.bdg
+macs2 cmbreps -i PRETREAT-3V-POLII-R1_treat_pileup.bdg PRETREAT-5V-POLII-R2_treat_pileup.bdg -m mean -o PRETREAT-V-POLII_treat_pileup.bdg
+
+macs2 cmbreps -i PRETREAT-3NEG-H3K27ac-R1_control_lambda.bdg PRETREAT-5NEG-H3K27ac-R2_control_lambda.bdg -m mean -o PRETREAT-NEG-H3K27ac_control_lambda.bdg
+macs2 cmbreps -i PRETREAT-3NEG-H3K27me3-R1_control_lambda.bdg PRETREAT-5NEG-H3K27me3-R2_control_lambda.bdg -m mean -o PRETREAT-NEG-H3K27me3_control_lambda.bdg
+macs2 cmbreps -i PRETREAT-3NEG-H3K4me3-R1_control_lambda.bdg PRETREAT-5NEG-H3K4me3_control_lambda.bdg -m mean -o PRETREAT-NEG-H3K4me3_control_lambda.bdg
+macs2 cmbreps -i PRETREAT-3NEG-POLII-R1_control_lambda.bdg PRETREAT-5NEG-POLII-R2_control_lambda.bdg -m mean -o PRETREAT-NEG-POLII_control_lambda.bdg
+macs2 cmbreps -i PRETREAT-3V-H3K27ac-R1_control_lambda.bdg PRETREAT-5V-H3K27ac-R2_control_lambda.bdg -m mean -o PRETREAT-V-H3K27ac_control_lambda.bdg
+macs2 cmbreps -i PRETREAT-3V-H3K27me3-R1_control_lambda.bdg PRETREAT-5V-H3K27me3-R2_control_lambda.bdg -m mean -o PRETREAT-V-H3K27me3_control_lambda.bdg
+macs2 cmbreps -i PRETREAT-3V-H3K4me3-R1_control_lambda.bdg PRETREAT-5V-H3K4me3-R2_control_lambda.bdg -m mean -o PRETREAT-V-H3K4me3_control_lambda.bdg
+macs2 cmbreps -i PRETREAT-3V-POLII-R1_control_lambda.bdg PRETREAT-5V-POLII-R2_control_lambda.bdg -m mean -o PRETREAT-V-POLII_control_lambda.bdg
+
+# get diff peaks for some comparisons
+macs2 bdgdiff --t1 LATE-3NP-H3K4me3_treat_pileup.bdg --c1 LATE-3NP-H3K4me3_control_lambda.bdg --t2 LATE-3ND-H3K4me3_treat_pileup.bdg --c2 LATE-3ND-H3K4me3_control_lambda.bdg --o-prefix LATE_H3K4me3_NPvND --outdir macs_diff
+macs2 bdgdiff --t1 LATE-3dD-H3K4me3_treat_pileup.bdg --c1 LATE-3dD-H3K4me3_control_lambda.bdg --t2 LATE-3ND-H3K4me3_treat_pileup.bdg --c2 LATE-3ND-H3K4me3_control_lambda.bdg --o-prefix LATE_H3K4me3_dDvND --outdir macs_diff
+macs2 bdgdiff --t1 LATE-3dP-H3K4me3_treat_pileup.bdg --c1 LATE-3dP-H3K4me3_control_lambda.bdg --t2 LATE-3NP-H3K4me3_treat_pileup.bdg --c2 LATE-3NP-H3K4me3_control_lambda.bdg --o-prefix LATE_H3K4me3_dPvNP --outdir macs_diff
+
+macs2 bdgdiff --t1 LATE-3NP-H3K27ac_treat_pileup.bdg --c1 LATE-3NP-H3K27ac_control_lambda.bdg --t2 LATE-3ND-H3K27ac_treat_pileup.bdg --c2 LATE-3ND-H3K27ac_control_lambda.bdg --o-prefix LATE_H3K27ac_NPvND --outdir macs_diff
+macs2 bdgdiff --t1 LATE-3dD-H3K27ac_treat_pileup.bdg --c1 LATE-3dD-H3K27ac_control_lambda.bdg --t2 LATE-3ND-H3K27ac_treat_pileup.bdg --c2 LATE-3ND-H3K27ac_control_lambda.bdg --o-prefix LATE_H3K27ac_dDvND --outdir macs_diff
+macs2 bdgdiff --t1 LATE-3dP-H3K27ac_treat_pileup.bdg --c1 LATE-3dP-H3K27ac_control_lambda.bdg --t2 LATE-3NP-H3K27ac_treat_pileup.bdg --c2 LATE-3NP-H3K27ac_control_lambda.bdg --o-prefix LATE_H3K27ac_dPvNP --outdir macs_diff
+
+# early timepoints as well
+macs2 bdgdiff --t1 EARLY-3NP-H3K4me3-R1_treat_pileup.bdg --c1 EARLY-3NP-H3K4me3-R1_control_lambda.bdg --t2 EARLY-3ND-H3K4me3-R1_treat_pileup.bdg --c2 EARLY-3ND-H3K4me3-R1_control_lambda.bdg --o-prefix EARLY_H3K4me3_NPvND --outdir macs_diff
+macs2 bdgdiff --t1 EARLY-3dD-H3K4me3-R1_treat_pileup.bdg --c1 EARLY-3dD-H3K4me3-R1_control_lambda.bdg --t2 EARLY-3ND-H3K4me3-R1_treat_pileup.bdg --c2 EARLY-3ND-H3K4me3-R1_control_lambda.bdg --o-prefix EARLY_H3K4me3_dDvND --outdir macs_diff
+macs2 bdgdiff --t1 EARLY-3dP-H3K4me3-R1_treat_pileup.bdg --c1 EARLY-3dP-H3K4me3-R1_control_lambda.bdg --t2 EARLY-3NP-H3K4me3-R1_treat_pileup.bdg --c2 EARLY-3NP-H3K4me3-R1_control_lambda.bdg --o-prefix EARLY_H3K4me3_dPvNP --outdir macs_diff
+
+macs2 bdgdiff --t1 EARLY-3NP-H3K27ac-R1_treat_pileup.bdg --c1 EARLY-3NP-H3K27ac-R1_control_lambda.bdg --t2 EARLY-3ND-H3K27ac-R1_treat_pileup.bdg --c2 EARLY-3ND-H3K27ac-R1_control_lambda.bdg --o-prefix EARLY_H3K27ac_NPvND --outdir macs_diff
+macs2 bdgdiff --t1 EARLY-3dD-H3K27ac-R1_treat_pileup.bdg --c1 EARLY-3dD-H3K27ac-R1_control_lambda.bdg --t2 EARLY-3ND-H3K27ac-R1_treat_pileup.bdg --c2 EARLY-3ND-H3K27ac-R1_control_lambda.bdg --o-prefix EARLY_H3K27ac_dDvND --outdir macs_diff
+macs2 bdgdiff --t1 EARLY-3dP-H3K27ac-R1_treat_pileup.bdg --c1 EARLY-3dP-H3K27ac-R1_control_lambda.bdg --t2 EARLY-3NP-H3K27ac-R1_treat_pileup.bdg --c2 EARLY-3NP-H3K27ac-R1_control_lambda.bdg --o-prefix EARLY_H3K27ac_dPvNP --outdir macs_diff
+```
+
+# bedgraphs from macs appear to be best normalised, convert these to bigwigs for heatmaps
+```{bash}
+for bdg in macs/broadpeaks/*_treat_pileup.bdg
+do
+sbatch scripts/bedgraphToBigwig.sbatch $bdg
+done
+
+# 3 timed out at 2 hours, so rerunning these on prod_med with more time.
+sbatch scripts/bedgraphToBigwig.sbatch macs/broadpeaks/PRETREAT-NEG-H3K27ac_treat_pileup.bdg
+sbatch scripts/bedgraphToBigwig.sbatch macs/broadpeaks/PRETREAT-V-H3K4me3_treat_pileup.bdg
+```
+
+# make heatmaps over reactivating genes using MACS normalised bedgraphs
+```{bash}
+sbatch scripts/DTMatrix_PRETREAT_POLII_MACS_reactGenes.sbatch
+sbatch scripts/DTMatrix_PRETREAT_H3K27ac_MACS_reactGenes.sbatch
+sbatch scripts/DTMatrix_PRETREAT_H3K27me3_MACS_reactGenes.sbatch
+sbatch scripts/DTMatrix_PRETREAT_H3K4me3_MACS_reactGenes.sbatch
+sbatch scripts/DTMatrix_EARLY_H3K27ac_MACS_reactGenes.sbatch
+sbatch scripts/DTMatrix_EARLY_H3K27me3_MACS_reactGenes.sbatch
+sbatch scripts/DTMatrix_EARLY_H3K4me3_MACS_reactGenes.sbatch
+sbatch scripts/DTMatrix_LATE_H3K27ac_MACS_reactGenes.sbatch
+sbatch scripts/DTMatrix_LATE_H3K27me3_MACS_reactGenes.sbatch
+sbatch scripts/DTMatrix_LATE_H3K4me3_MACS_reactGenes.sbatch
+```
+
+# also make heatmaps over all genes using MACS normalised bedgraphs
+```{bash}
+sbatch scripts/DTMatrix_PRETREAT_POLII_MACS_allGenes.sbatch
+sbatch scripts/DTMatrix_PRETREAT_H3K27ac_MACS_allGenes.sbatch
+sbatch scripts/DTMatrix_PRETREAT_H3K27me3_MACS_allGenes.sbatch
+sbatch scripts/DTMatrix_PRETREAT_H3K4me3_MACS_allGenes.sbatch
+sbatch scripts/DTMatrix_EARLY_H3K27ac_MACS_allGenes.sbatch
+sbatch scripts/DTMatrix_EARLY_H3K27me3_MACS_allGenes.sbatch
+sbatch scripts/DTMatrix_EARLY_H3K4me3_MACS_allGenes.sbatch
+sbatch scripts/DTMatrix_LATE_H3K27ac_MACS_allGenes.sbatch
+sbatch scripts/DTMatrix_LATE_H3K27me3_MACS_allGenes.sbatch
+sbatch scripts/DTMatrix_LATE_H3K4me3_MACS_allGenes.sbatch
+```
+
+# look at K27ac over superenhancers
+```{bash}
+sbatch scripts/DTMatrix_LATE_H3K27ac_MACS_SE.sbatch
+sbatch scripts/DTMatrix_EARLY_H3K27ac_MACS_SE.sbatch
+sbatch scripts/DTMatrix_PRETREAT_H3K27ac_MACS_SE.sbatch
+```
+
+# look into other norm methods for early K27ac
+# first make heatmap w/TMM norm
+```{bash}
+sbatch scripts/DTMatrix_EARLY_H3K27ac_TMM_allGenes.sbatch
+```
+
+# get RLE norm
+```{r}
+# print TMM norm factors
+> k27a.dge$samples$norm.factors
+ [1] 1.0405643 0.9761023 1.0971529 0.9424272 1.0672156 1.0149249 1.0250193 0.7952129 0.9188531 0.9376195 1.0084657 1.0625148 1.0352278 0.7860209 1.1220970 1.0799486
+[17] 1.0914530 1.0855302
+
+k27a.dge <- calcNormFactors(k27a.dge, method = "RLE")
+
+# Print RLE norm factors
+> k27a.dge$samples$norm.factors
+ [1] 1.0186599 0.9680201 1.0690175 0.9458933 0.9723826 1.0254119 0.9497151 0.9018029 0.9806601 0.9908680 0.9771624 1.0902570 0.9540948 0.8956703 1.0989104 1.0629846
+[17] 1.0706009 1.0615306
+
+# make and write out scale factor doc to run DT script
+k27a.bam.rlesf <- paste0("alignment/", rownames(k27a.dge$samples), ".sort.bam:", k27a.dge$samples$norm.factors)
+write.table(
+  k27a.bam.rlesf,
+  file.path(align.dir, "K27ac_bam_RLEsf.txt"),
+  quote = FALSE,
+  row.names = FALSE,
+  col.names = FALSE
+)
+```
+
+# make new bigwigs norm by RLE
+```{bash}
+while read -r line
+do
+IFS=: read -r bam sf <<< $line
+sbatch scripts/DeeptoolsBamCov.sbatch $bam $sf
+done < alignment/K27ac_bam_RLEsf.txt
+```
+
+# now make RLE heatmap
+```{bash}
+sbatch scripts/DTMatrix_EARLY_H3K27ac_RLE_allGenes.sbatch
+```
+
+# try greenlist normalisation on H3K27ac
+```{r}
+# load greenlist and make saf to get counts over greenlist regions
+green.bed <- fread("bed_files/hg38_CUTnRUN_greenlist.v1.bed")
+
+green.saf <- data.frame(
+  "GeneID" = paste0(green.bed$V4, "_", 1:nrow(green.bed)),
+  "Chr" = green.bed$V1,
+  "Start" = green.bed$V2, 
+  "End" = green.bed$V3,
+  "Strand" = "."
+)
+  
+k27a.green <- featureCounts(
+  k27a.bams,
+  annot.ext = green.saf,
+  isPairedEnd = FALSE,
+  useMetaFeatures = FALSE
+)
+colnames(k27a.green$counts) <- gsub(".sort.bam", "", colnames(k27a.green$counts))
+
+# now load into edger object and TMM normalise
+green.dge <- DGEList(k27a.green$counts)
+green.dge <- calcNormFactors(green.dge, method = "TMM")
+
+# make and write out scale factor doc to run DT script
+green.bam.sf <- paste0("alignment/", rownames(green.dge$samples), ".sort.bam:", green.dge$samples$norm.factors)
+write.table(
+  green.bam.sf,
+  file.path(align.dir, "K27ac_bam_sf_greenlist.txt"),
+  quote = FALSE,
+  row.names = FALSE,
+  col.names = FALSE
+)
+
+# remove low counts
+keep <- which(rowSums(k27a.green$counts > 1) >= 2)
+k27a.counts$counts <- k27a.counts$counts[keep, ]
+```
+
+# make new bigwigs norm by TMM and submit heatmap job for new bigwigs
+```{bash}
+while read -r line
+do
+IFS=: read -r bam sf <<< $line
+sbatch scripts/DeeptoolsBamCov.sbatch $bam $sf
+done < alignment/K27ac_bam_sf_greenlist.txt
+
+sbatch scripts/DTMatrix_EARLY_H3K27ac_GL_allGenes.sbatch
+```
+
+# make heatmaps of K4me3 samples for both reactivated and nonreactivated genelists
+```{bash}
+sbatch scripts/DTMatrix_PRETREAT_H3K4me3_MACS_2genelists.sbatch
+sbatch scripts/DTMatrix_LATE_H3K4me3_MACS_2genelists.sbatch
+sbatch scripts/DTMatrix_EARLY_H3K4me3_MACS_2genelists.sbatch
+```
+
+# make heatmaps for PolII at CGI promoters as in other datatypes
+```{bash}
+sbatch scripts/DTMatrix_PRETREAT_POLII_MACS_CGIprom.sbatch
+```
+
+
+
+
+# save session info
+```{r}
+sesh.info <- capture.output(sessionInfo())
+writeLines(
+  sesh.info,
+  file.path(project.dir, "session-info", paste0(Sys.Date(), "_CUTandRUN_230815.txt"))
+)
+```
