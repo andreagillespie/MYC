@@ -1,0 +1,8 @@
+3dD-1-Nascent_S419	/dawson_genomics/Projects/MYC/230420_TTseq/bams/3dD-1-Nascent_S419.sort.dedup.bam	case
+5dD-1-Nascent_S415	/dawson_genomics/Projects/MYC/230420_TTseq/bams/5dD-1-Nascent_S415.sort.dedup.bam	case
+5dD-2-Nascent_S391	/dawson_genomics/Projects/MYC/230420_TTseq/bams/5dD-2-Nascent_S391.sort.dedup.bam	case
+5dD-3-Nascent_S395	/dawson_genomics/Projects/MYC/230420_TTseq/bams/5dD-3-Nascent_S395.sort.dedup.bam	case
+3ND-1-Nascent_S417	/dawson_genomics/Projects/MYC/230420_TTseq/bams/3ND-1-Nascent_S417.sort.dedup.bam	control
+5ND-1-Nascent_S400	/dawson_genomics/Projects/MYC/230420_TTseq/bams/5ND-1-Nascent_S400.sort.dedup.bam	control
+5ND-2-Nascent_S421	/dawson_genomics/Projects/MYC/230420_TTseq/bams/5ND-2-Nascent_S421.sort.dedup.bam	control
+5ND-3-Nascent_S393	/dawson_genomics/Projects/MYC/230420_TTseq/bams/5ND-3-Nascent_S393.sort.dedup.bam	control
