@@ -1,0 +1,105 @@
+---
+title: "ChIPseq_240307"
+author: "Andrea"
+date: "2024/03/12"
+output: html_document
+---
+
+fastq location: /pipeline/Runs/NextSeq/240307_VH01624_78_AACG7KLHV/ProjectFolders/Project_Jesse-Balic/
+project directory: /dawson_genomics/Projects/MYC/240307_ChIP/
+
+# set up project dir and process (fastqc, trim, align, tdfs)
+```{bash}
+mkdir alignment
+mkdir fastqc
+mkdir trimmed_fastqs
+mkdir logs
+mkdir scripts
+mkdir tdfs
+
+for fq in /pipeline/Runs/NextSeq/240307_VH01624_78_AACG7KLHV/ProjectFolders/Project_Jesse-Balic/Sample*/*_R1_001.fastq.gz
+do
+sbatch scripts/alignHg38.sbatch $fq
+done
+
+module load multiqc/1.8
+multiqc .
+```
+
+# peak calling (both narrow and broad) include bedgraph output for Spark plots and diff peaks if needed
+```{bash}
+mkdir macs/narrowpeaks
+mkdir macs/broadpeaks
+
+for bam in alignment/*ac-DMSO*sort.rmdup.bam
+do
+sbatch scripts/macs2.sbatch $bam alignment/Input-DMSO-R1_S146.sort.rmdup.bam
+done
+
+for bam in alignment/*ac-A485-R*sort.rmdup.bam
+do
+sbatch scripts/macs2.sbatch $bam alignment/Input-A485-R1_S147.sort.rmdup.bam
+done
+
+for bam in alignment/*ac-dTAG-R*sort.rmdup.bam
+do
+sbatch scripts/macs2.sbatch $bam alignment/Input-dTAG-R1_S148.sort.rmdup.bam
+done
+
+for bam in alignment/*ac-A485-dTAG*sort.rmdup.bam
+do
+sbatch scripts/macs2.sbatch $bam alignment/Input-A485-dTAG-R1_S150.sort.rmdup.bam
+done
+```
+
+# convert MACS bedgraphs to bigwigs as in C&R
+```{bash}
+for bdg in macs/broadpeaks/*_treat_pileup.bdg
+do
+sbatch scripts/bedgraphToBigwig.sbatch $bdg
+done
+```
+
+# combine reps and get macs norm bigwigs for further heatmaps
+```{bash}
+module load macs/2.2.7.1
+cd macs/broadpeaks
+
+macs2 cmbreps -i H2BK20ac-A485-dTAG-R1_S154_treat_pileup.bdg H2BK20ac-A485-dTAG-R2_S158_treat_pileup.bdg -m mean -o H2BK20ac-A485-dTAG_treat_pileup.bdg
+macs2 cmbreps -i H2BK20ac-A485-R1_S152_treat_pileup.bdg H2BK20ac-A485-R2_S156_treat_pileup.bdg -m mean -o H2BK20ac-A485_treat_pileup.bdg
+macs2 cmbreps -i H2BK20ac-DMSO-R1_S149_treat_pileup.bdg H2BK20ac-DMSO-R2_S155_treat_pileup.bdg -m mean -o H2BK20ac-DMSO_treat_pileup.bdg
+macs2 cmbreps -i H2BK20ac-dTAG-R1_S153_treat_pileup.bdg H2BK20ac-dTAG-R2_S157_treat_pileup.bdg -m mean -o H2BK20ac-dTAG_treat_pileup.bdg
+
+macs2 cmbreps -i H3K27ac-A485-dTAG-R1_S141_treat_pileup.bdg H3K27ac-A485-dTAG-R2_S145_treat_pileup.bdg -m mean -o H3K27ac-A485-dTAG_treat_pileup.bdg
+macs2 cmbreps -i H3K27ac-A485-R1_S139_treat_pileup.bdg H3K27ac-A485-R2_S143_treat_pileup.bdg -m mean -o H3K27ac-A485_treat_pileup.bdg
+macs2 cmbreps -i H3K27ac-DMSO-R1_S159_treat_pileup.bdg H3K27ac-DMSO-R2_S142_treat_pileup.bdg -m mean -o H3K27ac-DMSO_treat_pileup.bdg
+macs2 cmbreps -i H3K27ac-dTAG-R1_S140_treat_pileup.bdg H3K27ac-dTAG-R2_S144_treat_pileup.bdg -m mean -o H3K27ac-dTAG_treat_pileup.bdg
+
+cd ../..
+
+sbatch scripts/bedgraphToBigwig.sbatch macs/broadpeaks/H2BK20ac-A485-dTAG_treat_pileup.bdg
+sbatch scripts/bedgraphToBigwig.sbatch macs/broadpeaks/H2BK20ac-A485_treat_pileup.bdg
+sbatch scripts/bedgraphToBigwig.sbatch macs/broadpeaks/H2BK20ac-DMSO_treat_pileup.bdg
+sbatch scripts/bedgraphToBigwig.sbatch macs/broadpeaks/H2BK20ac-dTAG_treat_pileup.bdg
+
+sbatch scripts/bedgraphToBigwig.sbatch macs/broadpeaks/H3K27ac-A485-dTAG_treat_pileup.bdg
+sbatch scripts/bedgraphToBigwig.sbatch macs/broadpeaks/H3K27ac-A485_treat_pileup.bdg
+sbatch scripts/bedgraphToBigwig.sbatch macs/broadpeaks/H3K27ac-DMSO_treat_pileup.bdg
+sbatch scripts/bedgraphToBigwig.sbatch macs/broadpeaks/H3K27ac-dTAG_treat_pileup.bdg
+```
+
+# make genome wide plot (MANE) and 6 lists heatmap
+```{bash}
+sbatch scripts/DTMatrix_ac_6lists_merged_MACSnorm.sbatch
+sbatch scripts/DTMatrix_ac_MANE_merged_MACSnorm.sbatch
+```
+
+# H2BK20ac signal drowned out by H3K27ac signal, so plotting separately
+```{bash}
+sbatch scripts/DTMatrix_H2BK20ac_6lists_merged_MACSnorm.sbatch
+sbatch scripts/DTMatrix_H3K27ac_6lists_merged_MACSnorm.sbatch
+sbatch scripts/DTMatrix_H2BK20ac_MANE_merged_MACSnorm.sbatch
+sbatch scripts/DTMatrix_H3K27ac_MANE_merged_MACSnorm.sbatch
+```
+
+
