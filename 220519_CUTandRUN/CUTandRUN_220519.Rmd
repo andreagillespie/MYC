@@ -1,0 +1,50 @@
+---
+title: "CUTandRUN_220519"
+author: "Andrea"
+date: "25/05/2022"
+output: html_document
+---
+
+fastq dir: /pipeline/Runs/NextSeq/220519_NB501056_0802_AH3WTMBGXM/ProjectFolders/Project_Wendy-Jia/Sample_DV*/
+
+# use cut&run tools as in prev analysis, run step-wise only alignment & peak calling to get macs peaks
+```{bash}
+# run fastqc first
+mkdir fastqc
+
+for fq in /pipeline/Runs/NextSeq/220519_NB501056_0802_AH3WTMBGXM/ProjectFolders/Project_Wendy-Jia/Sample_DV*/*_R1_001.fastq.gz
+do
+bname=`basename $fq _R1_001.fastq.gz`
+sbatch scripts/fastqc.sbatch $fq /pipeline/Runs/NextSeq/220519_NB501056_0802_AH3WTMBGXM/ProjectFolders/Project_Wendy-Jia/Sample_DV*/${bname}_R2_001.fastq.gz
+done
+
+# run multiqc 
+module load multiqc/1.8
+cd fastqc
+multiqc .
+
+# make a working dir for cnrtools and run from there (set to work dir in config)
+mkdir cnrt_wd
+
+# run step-wise for more control, needs to be run from tools wd & use sym links in wd for fastqs
+cd cnrt_wd
+for fq in /pipeline/Runs/NextSeq/220519_NB501056_0802_AH3WTMBGXM/ProjectFolders/Project_Wendy-Jia/Sample_DV*/*fastq.gz
+do
+bname=`basename $fq`
+ln -s $fq fastq/$bname
+done
+
+# run validation and create scripts first, use software installed in prev project dir
+/dawson_genomics/Projects/JQ1VHL/CutandRun_211014_NB501056_0704_AHNYJVBGXK/cutandruntools/validate.py ../scripts/config.json
+/dawson_genomics/Projects/JQ1VHL/CutandRun_211014_NB501056_0704_AHNYJVBGXK/cutandruntools/create_scripts.py ../scripts/config.json
+
+for fq in fastq/*_R1_001.fastq.gz
+do
+sbatch integrated.sh $fq
+done
+
+for bam in aligned.aug10/*aligned_reads.bam
+do
+sbatch aligned.aug10/integrated.step2.sh $bam
+done
+```
