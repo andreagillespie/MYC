@@ -1,0 +1,380 @@
+---
+title: "SLAMseq_240531"
+author: "Andrea"
+date: "24/06/06"
+output: html_document
+---
+
+
+fastq location: /pipeline/Runs/NextSeq/240531_VH01624_109_AACJ3H3HV/ProjectFolders/Project_Jesse-Balic/
+project directory: /dawson_genomics/Projects/MYC/240531_SLAMseq
+
+# make utr bed from genome gtf and cat w/Dm
+```{bash}
+# make genome based region bed files as 3'utr bed needed for slamdunk
+python scripts/extract_transcript_regions.py -i \
+/data/reference/dawson_labs/genomes/Hg38/Homo_sapiens.GRCh38.102.gtf \
+-o /data/reference/dawson_labs/bed_files/Hg38/genomic_regions/Homo_sapiens.GRCh38.102 --gtf
+
+# also for Dm6
+python scripts/extract_transcript_regions.py -i \
+/data/reference/dawson_labs/genomes/BDGP6/Drosophila_melanogaster.BDGP6.32.109.gtf \
+-o /data/reference/dawson_labs/bed_files/Dm6/genomic_regions/Drosophila_melanogaster.BDGP6.32.109 --gtf
+
+# now cat w/ existing Dm bed
+cat /data/reference/dawson_labs/bed_files/Hg38/genomic_regions/Homo_sapiens.GRCh38.102_3utr.bed \
+/data/reference/dawson_labs/bed_files/Dm6/genomic_regions/Drosophila_melanogaster.BDGP6.32.109_3utr.bed \
+> /data/reference/dawson_labs/joint_genomes/GRCh38BDGP6/GRCh38BDGP6_3utr.bed
+```
+
+# set up project dir and run SLAMDUNK pipeline. Unless otherwise noted, everything is run from the project directory
+```{bash}
+mkdir slamdunk
+mkdir fastq_screen
+mkdir fastqc
+mkdir trimmed_fastqs
+mkdir logs
+mkdir scripts
+mkdir session-info
+mkdir results
+mkdir plots
+
+for fq in /pipeline/Runs/NextSeq/240531_VH01624_109_AACJ3H3HV/ProjectFolders/Project_Jesse-Balic/*/*_R1_001.fastq.gz
+do
+sbatch scripts/slamHg38Dm6.sbatch $fq
+done
+
+module load multiqc/1.8
+multiqc .
+```
+
+# Change collapse .csv files to .tsv
+```{bash, eval = F}
+cd slamdunk/collapse
+mkdir tsv
+for file in *.csv; do cp "$file" tsv/"${file%.csv}.tsv"; done
+cd ../..
+```
+
+# load libraries and set paths
+```{r}
+library(edgeR)
+library(data.table)
+library(dplyr)
+library(RColorBrewer)
+library(Rsubread)
+library(ggplot2)
+library(ComplexHeatmap)
+library(circlize)
+library(qvalue)
+
+project.dir <- "/dawson_genomics/Projects/MYC/240531_SLAMseq"
+slam.dir <- file.path(project.dir, 'slamdunk')
+tsv.dir <- file.path(slam.dir, 'collapse/tsv')
+plots.dir <- file.path(project.dir, 'plots')
+results.dir <- file.path(project.dir, 'results')
+```
+
+# Read in slam-dunk collapse counts files
+# col8 is total count
+# col9 is TC count
+```{r}
+files <- list.files(tsv.dir)
+
+# make sample annotation, take careful note of order of files (alphabetical) and ensure consistency and correctness of annotation
+sample.ann <- data.frame(
+  "files" = files, 
+  "samples" = gsub("_R1_001_trimmed.fq_slamdunk_mapped_filtered_tcount_collapsed.tsv", "", files), 
+  "cells" = substr(files, 1, 5),
+  "treatment" = substr(files, 7, 10),
+  "replicate" = c(rep(1:3, 2), c(1, 1, 2, 2, 3, 3), rep(1:3, 4))
+  )
+sample.ann$treatment[grepl("unalkylkated", sample.ann$samples)] <- "DMSO_unalkylkated"
+sample.ann$group <- paste0(sample.ann$cells, "_", sample.ann$treatment)
+
+# load counts and sample information
+counts.dge = readDGE(
+  file = files, 
+  path = tsv.dir, 
+  columns = c(1, 8), 
+  group = sample.ann$group
+  )
+
+TCcounts.dge = readDGE(
+  file = files,
+  path = tsv.dir,
+  columns = c(1, 9), 
+  group = sample.ann$group
+  )
+
+# cleaning up names
+row.names(counts.dge$samples) <- sample.ann$samples
+row.names(TCcounts.dge$samples) <- sample.ann$samples
+colnames(counts.dge$counts) <- sample.ann$samples
+colnames(TCcounts.dge$counts) <- sample.ann$samples
+```
+
+# write out raw counts
+```{r}
+write.table(
+  counts.dge$counts, 
+  "results/counts_raw_all.txt",
+  sep = "\t",
+  quote = F
+  )
+
+write.table(
+  TCcounts.dge$counts, 
+  "results/TCcounts_raw_all.txt",
+  sep = "\t",
+  quote = F
+  )
+```
+
+# separate organisms counts objects and make list for looping
+```{r}
+dros <- which(substr(rownames(counts.dge), 1, 4) == "FBgn")
+
+dros.counts <- counts.dge[dros, ]
+dim(dros.counts)
+hg.counts <- counts.dge[-dros, ]
+dim(hg.counts)
+dros.TCcounts <- TCcounts.dge[dros, ]
+dim(dros.TCcounts)
+hg.TCcounts <- TCcounts.dge[-dros, ]
+dim(hg.TCcounts)
+
+counts.obs <- list(hg.counts, dros.counts, hg.TCcounts, dros.TCcounts)
+```
+
+# Filtering out counts of genes with low counts
+```{r}
+# apply filtering on human reads only (1 & 3)
+for(counts.i in c(1, 3)){
+  counts.cpms <- cpm(counts.obs[[counts.i]])
+  noint <- rownames(counts.obs[[counts.i]]) %in% c("__no_feature", "__ambiguous", "__too_low_aQual", "__not_aligned", "__alignment_not_unique")
+  keep <- rowSums(counts.cpms >= 1) >= 4 & !noint
+  print(table(keep))
+  counts.obs[[counts.i]] <- counts.obs[[counts.i]][keep,]
+}
+
+# set names for lists
+names(counts.obs) <- c("hg_counts", "dros_counts", "hg_TCcounts", "dros_TCcounts")
+```
+
+# annotate filtered count files and write out
+```{r}
+hg.ann <- fread("/data/reference/dawson_labs/biomart_annotations/Hsapiens/ensembl_hgnc_entrez.txt")
+
+counts.names <- c(rep("counts", 2), rep("TCcounts", 2))
+
+for(i in c(1, 3)){
+  filt.counts.ann <- as.data.frame(counts.obs[[i]]$counts)
+  filt.counts.ann$hg.ensg <- rownames(counts.obs[[i]])
+  filt.counts.ann <- left_join(filt.counts.ann, hg.ann, by = c("hg.ensg" = "ensembl_gene_id"))
+  write.table(
+    filt.counts.ann,
+    file.path(results.dir, paste0(counts.names[[i]], "_filtered.txt")),
+    sep = "\t",
+    quote = FALSE
+    )
+}
+```
+
+# Plot count numbers
+```{r}
+# Setting colours
+col.group <- counts.obs$hg_counts$samples$group
+levels(col.group) <- brewer.pal(nlevels(col.group), "Dark2") 
+col.group <- as.character(col.group)
+
+pdf(file = file.path(plots.dir, "barplots_summary.pdf"), width = 6, height = 4)
+barplot(
+  colSums(counts.obs$hg_counts$counts), 
+  las = 2, 
+  main = "total reads", 
+  names.arg = sample.ann$samples,
+  col = col.group,
+  cex.names = 0.35
+)
+barplot(
+  colSums(counts.obs$hg_TCcounts$counts), 
+  las = 2, 
+  main = "T>C reads", 
+  names.arg = sample.ann$samples,
+  col = col.group,
+  cex.names = 0.35
+  )
+barplot(
+  colSums(counts.obs$hg_TCcounts$counts)/colSums(counts.obs$hg_counts$counts)*100, 
+  las = 2, 
+  main = "percentage T>C", 
+  names.arg = sample.ann$samples,
+  col = col.group,
+  cex.names = 0.35
+  )
+barplot(
+  colSums(counts.obs$dros_counts$counts), 
+  las = 2, 
+  main = "spike-in total reads", 
+  names.arg = sample.ann$samples,
+  col = col.group,
+  cex.names = 0.35
+  )
+dev.off()
+```
+
+# TC%
+```{r}
+colSums(counts.obs$hg_TCcounts$counts)/colSums(counts.obs$hg_counts$counts)*100
+```
+
+# unnormalised MDS plots
+```{r}
+pdf(file.path(plots.dir, "MDS_unnorm_counts.pdf"))
+plotMDS(
+  counts.obs$hg_counts,
+  labels = rownames(counts.obs$hg_counts$sampleName),
+  main = "unnormalised counts",
+  col = col.group
+  )
+dev.off()
+```
+
+# MDS plot TC counts
+```{r}
+pdf(file.path(plots.dir, "MDS_unnorm_TCcounts.pdf"))
+plotMDS(
+  counts.obs$hg_TCcounts,
+  labels = rownames(counts.obs$hg_TCcounts$sampleName),
+  main = "unnormalised T>C counts",
+  col = col.group
+  )
+dev.off()
+```
+
+
+# check Dros normalisation 
+```{r}
+# calc TMM norm for dros counts first
+counts.obs$dros_counts <- calcNormFactors(counts.obs$dros_counts, method = "TMM")
+# now set same norm factors for hg counts and TCcounts
+counts.obs$hg_counts$samples$norm.factors <- counts.obs$dros_counts$samples$norm.factors
+counts.obs$hg_TCcounts$samples$norm.factors <- counts.obs$dros_counts$samples$norm.factors
+```
+
+# MDS for normalised data
+```{r}
+pdf(file.path(plots.dir, "MDS_spikeinnorm_counts.pdf"))
+plotMDS(
+  counts.obs$hg_counts,
+  labels = colnames(counts.obs$hg_counts), 
+  main = "Dm spike-in normalised counts",
+  col = col.group
+  )
+dev.off()
+```
+
+# MDS of normalised TCcounts
+```{r}
+pdf(file.path(plots.dir, "MDS_spikeinnorm_TCcounts.pdf"))
+plotMDS(
+  counts.obs$hg_TCcounts,
+  labels = colnames(counts.obs$hg_TCcounts), 
+  main = "Dm spike-in normalised T>C counts",
+  col = col.group
+  )
+dev.off()
+```
+
+# Now TMM as normalisation factor
+```{r}
+# calc TMM norm for all counts first
+counts.obs$hg_counts <- calcNormFactors(counts.obs$hg_counts, method = "TMM")
+# now set same norm factors for TCcounts
+counts.obs$hg_TCcounts$samples$norm.factors <- counts.obs$hg_counts$samples$norm.factors
+```
+
+# MDS for normalised data
+```{r}
+pdf(file.path(plots.dir, "MDS_TMMnorm_counts.pdf"))
+plotMDS(
+  counts.obs$hg_counts,
+  labels = colnames(counts.obs$hg_counts), 
+  main = "TMM normalised counts",
+  col = col.group
+  )
+dev.off()
+```
+
+# MDS of normalised TCcounts
+```{r}
+pdf(file.path(plots.dir, "MDS_TMMnorm_TCcounts.pdf"))
+plotMDS(
+  counts.obs$hg_TCcounts,
+  labels = colnames(counts.obs$hg_TCcounts), 
+  main = "TMM normalised TC counts",
+  col = col.group
+  )
+dev.off()
+```
+
+# start with TC counts using hg TMM normalisation
+# set design and contrasts
+```{r}
+# design table
+design = model.matrix(~0+group, data = counts.obs$hg_TCcounts$samples)
+colnames(design) <- gsub("group", colnames(design), replacement = "")
+design
+
+contr.matrix <- makeContrasts(
+  SF3B1_dTAGvsDMSO = SF3B1_dTAG-SF3B1_DMSO,
+  SF3B3_dTAGvDMSO = SF3B3_dTAG-SF3B3_DMSO,
+  SF3B3_PlaBvDMSO = SF3B3_PlaB-SF3B3_DMSO,
+  SF3B5_dTAGvDMSO = SF3B5_dTAG-SF3B5_DMSO,
+  levels = colnames(design)
+  )
+contr.matrix
+```
+
+# EdgeR DE
+```{r}
+# get annotation to include gene nameson tables
+hg.ann <- fread("/data/reference/dawson_labs/biomart_annotations/Hsapiens/ensembl_hgnc_entrez.txt")
+
+d_hg_TCcounts <- estimateDisp(counts.obs$hg_TCcounts, design)
+gfit_hg_TCcounts <- glmQLFit(d_hg_TCcounts, design)
+ftest.list <- list()
+
+for(con.i in 1:length(colnames(contr.matrix))){
+  ftest.list[[con.i]] <- glmQLFTest(gfit_hg_TCcounts, contrast = contr.matrix[ , con.i])
+  ftest.list[[con.i]]$table$ensg <- gsub("_3utr", "", rownames(ftest.list[[con.i]]$table))
+  ftest.list[[con.i]]$table <- merge(ftest.list[[con.i]]$table, hg.ann, by.x = "ensg", by.y = "ensembl_gene_id")
+  # add qvalues to table, order by that and write out
+  qv <- qvalue(ftest.list[[con.i]]$table$PValue)
+  ftest.list[[con.i]]$table$QValue <- qv$qvalues
+  ftest.list[[con.i]]$table <- ftest.list[[con.i]]$table[order(ftest.list[[con.i]]$table$QValue, decreasing = FALSE),]
+  write.table(
+    ftest.list[[con.i]]$table,
+    file.path(results.dir, paste0(colnames(contr.matrix)[con.i], "_ftest_table.txt")),
+    sep = "\t",
+    quote = FALSE,
+    col.names = TRUE,
+    row.names = FALSE
+  )
+}
+
+# add names for referencing
+names(ftest.list) <- colnames(contr.matrix)
+```
+
+
+
+# save session info
+```{r}
+sesh.info <- capture.output(sessionInfo())
+writeLines(
+  sesh.info,
+  file.path(project.dir, "session-info", paste0(Sys.Date(), "_SLAMseq_240531.txt"))
+)
+```
