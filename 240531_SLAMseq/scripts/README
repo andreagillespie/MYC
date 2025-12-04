@@ -1,0 +1,2 @@
+extract_transcript_regions.py and Transcript.py modified from original versions to
+parse gene_id rather than transcript_id to count at gene rather than transcript level.
