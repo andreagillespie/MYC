@@ -1,0 +1,118 @@
+---
+title: "ChIPseq_240508"
+author: "Andrea"
+date: "2024/05/13"
+output: html_document
+---
+
+fastq location: /pipeline/Runs/NextSeq/240508_VH01624_95_AACGY3MHV/ProjectFolders/Project_Jesse-Balic/
+project directory: /dawson_genomics/Projects/MYC/240508_ChIP/
+
+# set up project dir and process (fastqc, trim, align, tdfs)
+```{bash}
+mkdir alignment
+mkdir fastqc
+mkdir trimmed_fastqs
+mkdir logs
+mkdir scripts
+mkdir tdfs
+mkdir fastq_screen
+
+for fq in /pipeline/Runs/NextSeq/240508_VH01624_95_AACGY3MHV/ProjectFolders/Project_Jesse-Balic/Sample*/*_R1_001.fastq.gz
+do
+sbatch scripts/alignHg38BDGP6.sbatch $fq
+done
+```
+
+# run fastq screen to check spike-in proportion
+```{bash}
+for fq in /pipeline/Runs/NextSeq/240508_VH01624_95_AACGY3MHV/ProjectFolders/Project_Jesse-Balic/Sample*/*_R1_001.fastq.gz
+do
+sbatch scripts/fastq_screen.sbatch $fq 
+done
+
+module load multiqc/1.8
+multiqc -ip .
+```
+
+# peak calling (both narrow and broad) include bedgraph output for Spark plots and diff peaks if needed
+```{bash}
+mkdir macs/narrowpeaks
+mkdir macs/broadpeaks
+
+for bam in alignment/*DSSO-HA*sort.rmdup.bam
+do
+sbatch scripts/macs2.sbatch $bam alignment/DSSO-input_S96.sort.rmdup.bam
+done
+
+for bam in alignment/*EGS-HA*sort.rmdup.bam
+do
+sbatch scripts/macs2.sbatch $bam alignment/EGS-input_S101.sort.rmdup.bam
+done
+
+for bam in alignment/[CJKT][DUAB]*sort.rmdup.bam
+do
+sbatch scripts/macs2.sbatch $bam alignment/TF-ChIP-input_S94.sort.rmdup.bam
+done
+```
+
+# convert MACS bedgraphs to bigwigs as in C&R
+```{bash}
+mkdir bigwigs
+
+for bdg in macs/broadpeaks/*_treat_pileup.bdg
+do
+sbatch scripts/bedgraphToBigwig.sbatch $bdg
+done
+```
+
+# make genome wide plot (MANE) and 6 lists heatmap for all marks
+```{bash}
+mkdir results
+mkdir plots
+
+sbatch scripts/DTMatrix_CDK9_6lists_MACSnorm.sbatch
+sbatch scripts/DTMatrix_JUN_6lists_MACSnorm.sbatch
+sbatch scripts/DTMatrix_KAT2A_6lists_MACSnorm.sbatch
+sbatch scripts/DTMatrix_TBP_6lists_MACSnorm.sbatch
+sbatch scripts/DTMatrix_DSSO_6lists_MACSnorm.sbatch
+sbatch scripts/DTMatrix_EGS_6lists_MACSnorm.sbatch
+
+sbatch scripts/DTMatrix_CDK9_MANE_MACSnorm.sbatch
+sbatch scripts/DTMatrix_JUN_MANE_MACSnorm.sbatch
+sbatch scripts/DTMatrix_KAT2A_MANE_MACSnorm.sbatch
+sbatch scripts/DTMatrix_TBP_MANE_MACSnorm.sbatch
+sbatch scripts/DTMatrix_DSSO_MANE_MACSnorm.sbatch
+sbatch scripts/DTMatrix_EGS_MANE_MACSnorm.sbatch
+```
+
+# also make fingerprint plots for CDK9 & KAT2A
+```{bash}
+sbatch scripts/plotFingerprint_KAT2A.sbatch
+sbatch scripts/plotFingerprint_CDK9.sbatch
+```
+
+# make DT plots for react vs non in JUN & TBP
+```{bash}
+sbatch scripts/DTMatrix_JUN_2genelists_MACSnorm.sbatch
+sbatch scripts/DTMatrix_TBP_2genelists_MACSnorm.sbatch
+```
+
+# make heatmap for JUN based on P300 combo heatmap coords
+```{bash}
+sbatch scripts/DTMatrix_JUN_6lists_MACSnorm_P300comboSort.sbatch
+```
+
+# make RPGC norm bigwigs for deeptools plots
+```{bash}
+for bam in alignment/*sort.rmdup.bam
+do
+sbatch scripts/DeeptoolsBamCov.sbatch $bam
+done
+```
+
+# make new JUN heatmaps with RPGC norm
+```{bash}
+sbatch scripts/DTMatrix_JUN_6lists_RPGCnorm_P300comboSort.sbatch
+sbatch scripts/DTMatrix_JUN_MANE_RPGCnorm.sbatch
+```
