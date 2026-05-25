@@ -1,0 +1,169 @@
+---
+title: "BEscreen_240201"
+author: "Andrea"
+date: "2026-05-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+# Nicole used the same guides as Dane's P300 library (ABE & BE4) so reprocessing
+# Dane's original screen to compare hits between them
+# looking at changes in MYC expression, sorted by high/low neon green -> compare
+# each of these to respective controls
+# 2x timepoints, 2x replicates, both WT & KO background
+
+fastq dir: /pipeline/Archives/NextSeq/240201_VH01624_66_AAF322FM5/ProjectFolders/Project_Dane-Vassiliadis/Sample*
+project dir: /dawson_genomics/Projects/MYC/240201_P300_BE_reactivation_screen/Andrea_analysis
+
+# align base editor library to guide library fasta 
+# aligning with 0 mismatches to start 
+```{bash}
+mkdir fastqc
+mkdir logs
+mkdir trimmed_fastqs
+mkdir alignment
+mkdir session-info
+mkdir mapped_guides
+mkdir guide_counts
+
+# align to guide library
+for fq in /pipeline/Archives/NextSeq/240201_VH01624_66_AAF322FM5/ProjectFolders/Project_Dane-Vassiliadis/Sample*/*fastq.gz
+do
+sbatch scripts/MapCRISPR.sbatch $fq
+done
+
+module load py-multiqc/1.15-gcc-13.2.0
+multiqc .
+```
+
+# load libraries and set paths
+```{r}
+library(data.table)
+library(limma)
+
+project.dir <- "/dawson_genomics/Projects/MYC/240201_P300_BE_reactivation_screen/Andrea_analysis"
+counts.dir <- file.path(project.dir, "guide_counts")
+```
+
+# combine guide counts into a counts table
+```{r}
+gc.files <- list.files(counts.dir)
+all.counts <- fread(file.path(counts.dir, gc.files[1]), skip = 1)
+colnames(all.counts) <- c(gc.files[1], "sgRNA")
+for(gc in gc.files[-1]){
+  counts <- fread(file.path(counts.dir, gc), skip = 1)
+  colnames(counts) <- c(gc, "sgRNA")
+  all.counts <- merge(all.counts, counts, by = "sgRNA", all = TRUE)
+}
+colnames(all.counts) <- gsub(".guideCounts.txt", "", colnames(all.counts))
+
+# convert to mageck format
+sg.split <- strsplit2(all.counts$sgRNA, "_")
+all.counts$gene <- sg.split[, 1]
+all.counts <- all.counts[, c(1, 40, 2:39)]
+
+# clear up any issues or formatting that are problematic for mageck
+# are there any NAs?
+sum(is.na(all.counts))
+# [1] 130
+# change any NAs to 0 counts 
+all.counts[is.na(all.counts)] <- 0
+# write out all.counts table
+write.table(
+  all.counts,
+  file.path(counts.dir, "all_guideCounts.txt"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+
+# filter out very low counts, a couple of problematic guides should be removed
+# require at least 100 counts in at least half of the samples
+keep <- which(rowSums(all.counts >= 100) >= 19)
+# have a look at those guides which failed filter
+all.counts[-keep, ]
+# these 5 guides are all consistently low across the board
+
+filt.counts <- all.counts[keep, ]
+write.table(
+  filt.counts,
+  file.path(counts.dir, "filtered_guideCounts.txt"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+
+# run mageck test for desired comparisons
+```{bash}
+# run interactively in Centos container 
+sruncentos # locally aliased
+source /etc/profile.d/modules.sh
+
+mkdir mageck_counts
+
+module purge
+module load mageck/0.5.9
+module load scipy/1.7.3
+module load R/4.4.2
+
+mageck test -k guide_counts/filtered_guideCounts.txt \
+  -t 3-ABE-B2-dP-HI-48h_S20,3-ABE-F1-dP-HI-48h_S57 \
+  -c 3-ABE-B2-dP-LIB-48h_S41,3-ABE-F1-dP-LIB-48h_S30 \
+  -n mageck_counts/3_ABE_dP_48h_HI_vs_LIB \
+  --remove-zero both --pdf-report --keep-tmp
+mageck test -k guide_counts/filtered_guideCounts.txt \
+  -t 3-ABE-B2-dP-LO-48h_S28,3-ABE-F1-dP-LO-48h_S27 \
+  -c 3-ABE-B2-dP-LIB-48h_S41,3-ABE-F1-dP-LIB-48h_S30 \
+  -n mageck_counts/3_ABE_dP_48h_LO_vs_LIB \
+  --remove-zero both --pdf-report --keep-tmp
+  
+mageck test -k guide_counts/filtered_guideCounts.txt \
+  -t 3-BE4-75-dP-HI-48h_S21,3-BE4-78-dP-HI-48h_S22 \
+  -c 3-BE4-75-dP-LIB-48h_S51,3-BE4-78-dP-LIB-48h_S52 \
+  -n mageck_counts/3_BE4_dP_48h_HI_vs_LIB \
+  --remove-zero both --pdf-report --keep-tmp
+mageck test -k guide_counts/filtered_guideCounts.txt \
+  -t 3-BE4-75-dP-LO-48h_S29,3-BE4-78-dP-LO-48h_S31 \
+  -c 3-BE4-75-dP-LIB-48h_S51,3-BE4-78-dP-LIB-48h_S52 \
+  -n mageck_counts/3_BE4_dP_48h_LO_vs_LIB \
+  --remove-zero both --pdf-report --keep-tmp
+
+mageck test -k guide_counts/filtered_guideCounts.txt \
+  -t 37-ABE-B3-dP-HI-48h_S23,37-ABE-F4-dP-HI-48h_S24 \
+  -c 37-ABE-B3-dP-LIB-48h_S53,37-ABE-F4-dP-LIB-48h_S54 \
+  -n mageck_counts/37_ABE_dP_48h_HI_vs_LIB \
+  --remove-zero both --pdf-report --keep-tmp
+mageck test -k guide_counts/filtered_guideCounts.txt \
+  -t 37-ABE-B3-dP-LO-48h_S32,37-ABE-F4-dP-LO-48h_S33 \
+  -c 37-ABE-B3-dP-LIB-48h_S53,37-ABE-F4-dP-LIB-48h_S54 \
+  -n mageck_counts/37_ABE_dP_48h_LO_vs_LIB \
+  --remove-zero both --pdf-report --keep-tmp
+  
+mageck test -k guide_counts/filtered_guideCounts.txt \
+  -t 37-BE4-A5-dP-HI-48h_S25,37-BE4-B5-dP-HI-48h_S26 \
+  -c 37-BE4-A5-dP-LIB-48h_S55,37-BE4-B5-dP-LIB-48h_S56 \
+  -n mageck_counts/37_BE4_dP_48h_HI_vs_LIB \
+  --remove-zero both --pdf-report --keep-tmp
+mageck test -k guide_counts/filtered_guideCounts.txt \
+  -t 37-BE4-A5-dP-LO-48h_S34,37-BE4-B5-dP-LO-48h_S35 \
+  -c 37-BE4-A5-dP-LIB-48h_S55,37-BE4-B5-dP-LIB-48h_S56 \
+  -n mageck_counts/37_BE4_dP_48h_LO_vs_LIB \
+  --remove-zero both --pdf-report --keep-tmp
+```
+
+
+# save session info
+```{r}
+sesh.info <- capture.output(sessionInfo())
+writeLines(
+  sesh.info,
+  file.path(project.dir, "session-info", paste0(Sys.Date(), "_BEscreen_240201.txt"))
+)
+```
